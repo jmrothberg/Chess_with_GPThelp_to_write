@@ -1,0 +1,16 @@
+# ChessBrain Requirements
+# Supports: DGX Spark (Blackwell), Mac Studio (MPS), Multi-GPU CUDA (4x A6000 Ada)
+#
+# For CUDA systems: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+# For Mac: pip install torch torchvision torchaudio (MPS support included)
+
+# Core PyTorch - version 2.9+ required for Blackwell support
+torch>=2.9.0
+torchvision>=0.18.0
+torchaudio>=2.4.0
+
+# Required - Adafactor optimizer
+transformers>=4.40.0
+
+# System packages (not pip installable):
+# - tkinter: sudo apt install python3-tk (Linux) or comes with Python (Mac/Windows)
