@@ -1,8 +1,53 @@
-# Chess_with_GPThelp_to_write
+# Chess with GPT-4 Help
 
-Added ability to use my custom Models made with Brain6 to play against an LLM like AI.
-Added 3D views for fun.
-A game of chess written with the help of GTP4
-I always wanted to write a game of chess that would beat me, so with GPT4 as my helper I did.
-Co-pilot in VSCODE was not really that helpful.  I had to take code, usually just a few functions and past it into my own GPT4 chatbot. I use my own, since I can edit my chat history.
-ChatGPT4 was great at times for finding bugs, but terribl at logic.  So I would often get a function, and then have to work the logic by hand. For example on the min/max, it wrote a good outline, but could not get the logic right.
+A Python chess game with AI opponent, written with assistance from GPT-4. Features 3D visualization and the ability to play against custom transformer models trained with [Brain6](https://github.com/jmrothberg/Brain6).
+
+## Features
+
+- **Full Chess Implementation**: Complete chess rules including castling, en passant, and pawn promotion
+- **AI Opponent**: Min-max algorithm with alpha-beta pruning
+- **3D Visualization**: Optional 3D board view for enhanced gameplay
+- **Custom AI Models**: Play against transformer-based models trained on chess games
+- **Interactive GUI**: Click-to-move interface with legal move highlighting
+
+## Installation
+
+```bash
+git clone https://github.com/jmrothberg/Chess_with_GPThelp_to_write.git
+cd Chess_with_GPThelp_to_write
+pip install pygame numpy
+```
+
+## Usage
+
+```bash
+python chess_game.py
+```
+
+## Development Story
+
+I always wanted to write a chess game that could beat me. With GPT-4 as my coding assistant, I finally did it.
+
+**What worked well:**
+- GPT-4 was excellent at finding bugs
+- Generated good function outlines and structure
+- Helped with boilerplate code
+
+**What required manual work:**
+- Game logic, especially min-max algorithm
+- GPT-4 would write good outlines but get the logic wrong
+- Had to debug and fix algorithm details by hand
+
+**Lesson learned:** AI coding assistants are great collaborators, but complex logic still requires human debugging.
+
+## Related Projects
+
+- [Brain6](https://github.com/jmrothberg/Brain6) - Train your own transformer models on chess games
+
+## Author
+
+**Jonathan M. Rothberg** - [@jmrothberg](https://github.com/jmrothberg)
+
+## License
+
+MIT License
