@@ -75,3 +75,10 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+
+# Chess datasets (too large for git)
+Chess_games_old_txt/
+Saved Games/
+chess_parquet/
+chess_txt_promotion_win/
+combined_chess_datasets/
