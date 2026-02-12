@@ -185,15 +185,15 @@ D_RESULT = 139
 
 ROLE_VOCAB_SIZE = 140
 
-# Chess defaults - optimized for 1800 ELO chess performance (matches README specifications)
+# Chess defaults - optimized for 10M Stockfish games on 4×48GB GPUs
 CHESS_DEFAULTS = {
-    'n_embd': 768,       # Embedding dimension - adjusted for 12 heads (768/12=64)
-    'n_head': 12,        # Query heads - allows more parallel attention
-    'n_kv_heads': 3,     # KV heads (4:1 GQA ratio) - true Grouped Query Attention
+    'n_embd': 512,       # Embedding dimension (512/8=64 per head)
+    'n_head': 8,         # Query heads
+    'n_kv_heads': 2,     # KV heads (4:1 GQA ratio)
     'block_size': 512,   # 4 tokens per ply: ~80 moves * 4 + specials ≈ 323 tokens
-    'n_layer': 8,        # Transformer layers - sufficient for 1800 ELO tactics
-    'dropout': 0.05,     # Reduced dropout for Stockfish games - high-quality data needs less regularization
-    'batch_size': 128,   # Conservative training batch size - prevents crashes with VNC/Cinnamon
+    'n_layer': 12,       # Transformer layers - deeper for tactical depth
+    'dropout': 0.0,      # No dropout - Stockfish games are deterministic, no noise to regularize
+    'batch_size': 512,   # Split across 4 GPUs (128 per GPU) - safe for 48GB GPUs
     'num_epochs': 3,     # Short training sessions (1-3 epochs) - matches session-based training
     'learning_rate': 4e-4,  # Learning rate - stable for short sessions
     'weight_decay': 0.01,   # Standard regularization
@@ -2259,32 +2259,29 @@ def _train_chess_model_core(text, checkpoint_data=None):
     gpu_capability = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (8, 6)
     is_blackwell_gpu = gpu_capability == (12, 1)  # Cache Blackwell detection
 
-    # Configure data loading for optimal chess training performance (README recommendation)
-    # For 1800 ELO: Keep num_workers=0 for single GPU - optimal for chess models
+    # Configure data loading for optimal chess training performance
     sampler = None
-    if isinstance(model, nn.DataParallel):
-        # Multi-GPU DataParallel setup - OPTIMIZED for Ubuntu multi-GPU systems
-        print(f"DataParallel: Using optimized configuration across {len(model.device_ids)} GPUs")
-        num_workers = min(32, os.cpu_count() // 2)  # Use more CPU cores for data loading (32 workers on 64-core system)
-        pin_memory = device.type == 'cuda'  # Pin memory for faster GPU transfers
-        persistent_workers = True  # Keep workers alive for max performance (but may leave zombies if killed)
-        prefetch_factor = 4  # Increased prefetch for better GPU utilization
+    if use_custom_parallel or isinstance(model, nn.DataParallel):
+        # Multi-GPU setup - use workers to keep GPUs fed
+        num_gpus_active = len(gpu_indices) if gpu_indices else 1
+        print(f"Multi-GPU: Configuring data loading for {num_gpus_active} GPUs")
+        num_workers = min(32, os.cpu_count() // 2)
+        pin_memory = device.type == 'cuda'
+        persistent_workers = True
+        prefetch_factor = 4
+    elif device.type == 'mps':
+        num_workers = min(4, os.cpu_count() // 2)
+        pin_memory = False
+        persistent_workers = True
+        prefetch_factor = 2
+        print(f"Mac Studio MPS: Using {num_workers} workers for accelerated data loading")
     else:
-        # Single GPU setup - optimized for device type
-        if device.type == 'mps':
-            # Mac Studio MPS: Use CPU cores for data loading acceleration
-            num_workers = min(4, os.cpu_count() // 2)  # Use CPU cores for data loading
-            pin_memory = False  # MPS doesn't benefit from pinned memory
-            persistent_workers = True  # Keep workers alive for better performance
-            prefetch_factor = 2  # Prefetch data for smoother training
-            print(f"Mac Studio MPS: Using {num_workers} workers for accelerated data loading")
-        else:
-            # CUDA: Traditional single GPU configuration for chess training
-            print("Single GPU: Using optimal configuration for chess training (num_workers=0)")
-            num_workers = 0  # No workers - optimal for single GPU chess training
-            pin_memory = device.type == 'cuda'  # Pin memory only for CUDA
-            persistent_workers = False
-            prefetch_factor = None
+        # Single CUDA GPU
+        print("Single GPU: Using optimal configuration for chess training")
+        num_workers = min(8, os.cpu_count() // 2)
+        pin_memory = device.type == 'cuda'
+        persistent_workers = num_workers > 0
+        prefetch_factor = 2 if num_workers > 0 else None
 
     # Print the number of model parameters
     num_params = sum(p.numel() for p in get_model_module(model).parameters())
