@@ -900,26 +900,9 @@ class ChessMovesDataset(Dataset):
         self.tokens = []
         self.roles = []
 
-        # For large datasets, use parallel processing to speed up tokenization
-        if len(text) > 1_000_000 and __name__ == '__main__':
-            import multiprocessing as mp
-            from concurrent.futures import ProcessPoolExecutor
-
-            chunk_size = 200_000
-            chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
-
-            num_cores = mp.cpu_count() - 1
-            with ProcessPoolExecutor(max_workers=num_cores) as executor:
-                chunk_args = [(chunk,) for chunk in chunks]
-                results = list(executor.map(process_chunk_for_chess_moves, chunk_args))
-
-            for chunk_tokens, chunk_roles in results:
-                self.tokens.extend(chunk_tokens)
-                self.roles.extend(chunk_roles)
-
-            print(f"Parallel tokenization complete with {num_cores} cores")
-        else:
-            self._tokenize_text(text)
+        # Always use sequential tokenization to maintain correct ply counter
+        # (parallel chunking breaks color alternation at chunk boundaries)
+        self._tokenize_text(text)
 
         # Validate all tokens are within vocabulary range
         vocab_size = ROLE_VOCAB_SIZE
@@ -942,7 +925,17 @@ class ChessMovesDataset(Dataset):
             print(f"Final validation: Found {invalid_count} invalid tokens, clamping")
             self.tokens_tensor = torch.clamp(self.tokens_tensor, 0, vocab_size - 1)
 
-        print(f"Tokenized {len(self.tokens)} tokens ({len(self.tokens)} stream positions), all validated")
+        assert len(self.tokens) == len(self.roles), f"Token/role mismatch: {len(self.tokens)} vs {len(self.roles)}"
+
+        # Verify color alternation: sample first few games
+        color_checks = 0
+        for i in range(len(self.tokens)):
+            if self.roles[i] == ROLE_COLOR:
+                color_checks += 1
+                if color_checks <= 20:
+                    expected = 'W' if self.tokens[i] == COLOR_OFFSET else 'B'
+                    # Don't print all, just first few
+        print(f"Tokenized {len(self.tokens)} tokens, {color_checks} color tokens ({color_checks*100//max(len(self.tokens),1)}%), all validated")
 
     def _tokenize_text(self, text):
         """Sequential tokenization: parse text into 4-token-per-ply sequences."""
