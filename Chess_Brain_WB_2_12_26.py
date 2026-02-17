@@ -822,6 +822,17 @@ class ChessModel(nn.Module):
             promo_mask = roles_flat == ROLE_PROMO
 
             label_smoothing = getattr(self, 'label_smoothing', 0.0)
+
+            # Normalize each head's loss by log(num_classes) so all heads
+            # start at ~1.0 and contribute equal gradient to the backbone.
+            # Without this, FROM/TO (64 classes, ln(64)=4.16) drown out
+            # COLOR (2 classes, ln(2)=0.69) by 6x.
+            import math
+            norm_color = math.log(2)
+            norm_from = math.log(64)
+            norm_to = math.log(64)
+            norm_promo = math.log(5)
+
             losses = []
 
             # COLOR loss
@@ -830,7 +841,7 @@ class ChessModel(nn.Module):
                 color_targets = targets_flat[color_mask] - COLOR_OFFSET
                 loss_color = F.cross_entropy(color_logits, color_targets,
                                              label_smoothing=label_smoothing)
-                losses.append(loss_color)
+                losses.append(loss_color / norm_color)
 
             # FROM loss
             if from_mask.any():
@@ -838,7 +849,7 @@ class ChessModel(nn.Module):
                 from_targets = targets_flat[from_mask] - FROM_OFFSET
                 loss_from = F.cross_entropy(from_logits, from_targets,
                                             label_smoothing=label_smoothing)
-                losses.append(loss_from)
+                losses.append(loss_from / norm_from)
 
             # TO loss (conditioned on FROM via emb_from)
             # Stream alignment: when target is TO, input token is FROM
@@ -851,7 +862,7 @@ class ChessModel(nn.Module):
                 to_targets = targets_flat[to_mask] - TO_OFFSET
                 loss_to = F.cross_entropy(to_logits, to_targets,
                                           label_smoothing=label_smoothing)
-                losses.append(loss_to)
+                losses.append(loss_to / norm_to)
 
             # PROMO loss
             if promo_mask.any():
@@ -859,7 +870,7 @@ class ChessModel(nn.Module):
                 promo_targets = targets_flat[promo_mask] - PROMO_OFFSET
                 loss_promo = F.cross_entropy(promo_logits, promo_targets,
                                              label_smoothing=label_smoothing)
-                losses.append(loss_promo)
+                losses.append(loss_promo / norm_promo)
 
             if losses:
                 loss = sum(losses) / len(losses)
@@ -1427,17 +1438,14 @@ def test_progress(epoch, num_epochs, batch_idx, data_loader, loss, model, x, tok
         num_plies = min(tokens_to_generate, 32)  # Each ply = 4 forward passes
         dev = input_seq.device
 
-        # Determine starting ply from input context (count COLOR tokens)
-        input_tokens = input_seq[0].tolist()
-        ply_count = sum(1 for t in input_tokens if t == COLOR_OFFSET or t == COLOR_OFFSET + 1)
-
         for _ in range(num_plies):
-            # 1. COLOR: force based on ply count (we always know whose turn it is)
-            color_idx = 0 if (ply_count % 2 == 0) else 1
+            # 1. COLOR prediction (model should learn W/B alternation)
+            output, _ = model_single(input_seq)
+            color_logits = output['color'][0, -1]  # [2]
+            color_idx = color_logits.argmax(dim=-1).item()
             color_tok = COLOR_OFFSET + color_idx
             input_seq = torch.cat([input_seq[:, 1:],
                                    torch.tensor([[color_tok]], device=dev)], dim=1)
-            ply_count += 1
 
             # 2. FROM prediction
             output, _ = model_single(input_seq)
