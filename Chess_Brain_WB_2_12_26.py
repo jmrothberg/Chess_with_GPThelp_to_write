@@ -866,6 +866,14 @@ class ChessModel(nn.Module):
             else:
                 loss = torch.tensor(0.0, device=idx.device)
 
+            # Store per-head losses for diagnostic logging
+            self._last_head_losses = {
+                'color': loss_color.item() if color_mask.any() else -1,
+                'from': loss_from.item() if from_mask.any() else -1,
+                'to': loss_to.item() if to_mask.any() else -1,
+                'promo': loss_promo.item() if promo_mask.any() else -1,
+            }
+
             return None, loss
         else:
             # Inference mode: return hidden states + head logits
@@ -1398,6 +1406,12 @@ def test_progress(epoch, num_epochs, batch_idx, data_loader, loss, model, x, tok
     was_training = model.training
     model.eval()
     model_single = model.module if isinstance(model, nn.DataParallel) else model
+
+    # Print per-head losses for diagnostics
+    model_raw_diag = model_single._orig_mod if hasattr(model_single, '_orig_mod') else model_single
+    if hasattr(model_raw_diag, '_last_head_losses'):
+        hl = model_raw_diag._last_head_losses
+        print(f"  Head losses -> color: {hl['color']:.4f}  from: {hl['from']:.4f}  to: {hl['to']:.4f}  promo: {hl['promo']:.4f}")
     # Handle torch.compile wrapper for direct attribute access
     model_raw = model_single._orig_mod if hasattr(model_single, '_orig_mod') else model_single
 
@@ -1413,14 +1427,17 @@ def test_progress(epoch, num_epochs, batch_idx, data_loader, loss, model, x, tok
         num_plies = min(tokens_to_generate, 32)  # Each ply = 4 forward passes
         dev = input_seq.device
 
+        # Determine starting ply from input context (count COLOR tokens)
+        input_tokens = input_seq[0].tolist()
+        ply_count = sum(1 for t in input_tokens if t == COLOR_OFFSET or t == COLOR_OFFSET + 1)
+
         for _ in range(num_plies):
-            # 1. COLOR prediction
-            output, _ = model_single(input_seq)
-            color_logits = output['color'][0, -1]  # [2]
-            color_idx = color_logits.argmax(dim=-1).item()
+            # 1. COLOR: force based on ply count (we always know whose turn it is)
+            color_idx = 0 if (ply_count % 2 == 0) else 1
             color_tok = COLOR_OFFSET + color_idx
             input_seq = torch.cat([input_seq[:, 1:],
                                    torch.tensor([[color_tok]], device=dev)], dim=1)
+            ply_count += 1
 
             # 2. FROM prediction
             output, _ = model_single(input_seq)
