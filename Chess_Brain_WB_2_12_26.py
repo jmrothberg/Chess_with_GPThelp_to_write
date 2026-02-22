@@ -1435,6 +1435,25 @@ def test_progress(epoch, num_epochs, batch_idx, data_loader, loss, model, x, tok
         num_plies = min(tokens_to_generate, 32)  # Each ply = 4 forward passes
         dev = input_seq.device
 
+        # Trim input to last complete ply boundary (PROMO or SPECIAL token)
+        # so generation always starts at the correct point in the 4-token cycle.
+        # Without this, if input ends mid-ply (e.g. at FROM), the color head
+        # gets a hidden state it was never trained on, producing garbage.
+        tokens_list = input_seq[0].tolist()
+        trim_to = len(tokens_list)
+        for j in range(len(tokens_list) - 1, -1, -1):
+            t = tokens_list[j]
+            if (PROMO_OFFSET <= t < PROMO_OFFSET + 5) or t in (STARTGAME, EOFG, W_RESULT, D_RESULT, PAD):
+                trim_to = j + 1
+                break
+        if trim_to < len(tokens_list):
+            input_seq = input_seq[:, :trim_to]
+            # Re-pad to block_size
+            pad_len = x.shape[-1] - trim_to
+            if pad_len > 0:
+                padding = torch.full((1, pad_len), PAD, dtype=torch.long, device=dev)
+                input_seq = torch.cat([padding, input_seq], dim=1)
+
         for _ in range(num_plies):
             # 1. COLOR prediction (model should learn W/B alternation)
             output, _ = model_single(input_seq)
