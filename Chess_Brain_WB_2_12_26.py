@@ -2773,10 +2773,52 @@ def _train_chess_model_core(text, checkpoint_data=None):
 
 # Main training function
 def train_chess_model():
-    """Main training entry point"""
-    # Single process mode - load data interactively
+    """Main training entry point. Ctrl+C during training lets you pick a new data file."""
     text, checkpoint_data = load_data_interactive()
-    _train_chess_model_core(text, checkpoint_data)
+
+    while True:
+        try:
+            _train_chess_model_core(text, checkpoint_data)
+            break  # Training completed normally
+        except KeyboardInterrupt:
+            print("\n\n" + "=" * 50)
+            print("Training interrupted! (Ctrl+C)")
+            print("=" * 50)
+            print("\nOptions:")
+            print("  n = Pick a new training data file (keep current model)")
+            print("  q = Quit")
+            try:
+                choice = input("\nChoice (n/q): ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                print("\nQuitting.")
+                break
+
+            if choice == 'n':
+                # Pick new file, keep model by loading the last saved checkpoint
+                print("\nSelect new training data file...")
+                file_path = create_file_dialog(
+                    title="Select New Chess Games File", filetypes=[("Text files", "*.txt")])
+                if not file_path:
+                    print("No file selected. Quitting.")
+                    break
+
+                print(f"Loading chess file: {file_path}")
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+                games = text.split('\n\n')
+                games = ['<STARTGAME>' + ' ' + game.strip() + ' ' + '<EOFG>'
+                         for game in games if game.strip()]
+                text = '\n'.join(games)
+                print(f"New dataset loaded. Games: {len(games)}, Characters: {len(text)}")
+
+                # Load the most recent checkpoint to continue from
+                checkpoint_data = load_model_file()
+                if checkpoint_data is None:
+                    print("No checkpoint found. Starting fresh.")
+                print("\nRestarting training with new data...\n")
+            else:
+                print("Quitting.")
+                break
 
 
 def load_data_interactive():
