@@ -129,25 +129,8 @@ else:
     print("❌ ERROR: No GPU available. This chess training requires GPU support (CUDA or MPS).")
     exit(1)
 
-# Signal handler for clean shutdown (Ctrl+C)
-def signal_handler(sig, frame):
-    """Handle Ctrl+C to cleanly terminate all processes"""
-    print('\n🛑 Training interrupted by user (Ctrl+C)')
-    print('🧹 Cleaning up processes and GPU memory...')
-
-    try:
-        # Force cleanup of GPU memory
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            print('✅ GPU memory cleared')
-    except Exception as e:
-        print(f'⚠️  GPU cleanup failed: {e}')
-
-    print('👋 Training terminated cleanly')
-    sys.exit(0)
-
-# Register the signal handler
-signal.signal(signal.SIGINT, signal_handler)
+# Ctrl+C is handled by the training loop (train_chess_model) to allow
+# switching data files without quitting. No signal handler needed.
 
 # At the beginning of your script, after device selection:
 if device.type == 'mps':
