@@ -1808,6 +1808,13 @@ def _train_chess_model_core(text, checkpoint_data=None):
     vocab_size = len(move_to_idx)
     print(f"Vocabulary size: {vocab_size}")
 
+    # Set up Ctrl+C handler for graceful training interruption
+    _interrupt_requested = [False]
+    def _sigint_handler(sig, frame):
+        _interrupt_requested[0] = True
+        print("\n\nCtrl+C detected! Will pause after current batch...")
+    _old_sigint = signal.signal(signal.SIGINT, _sigint_handler)
+
     # Ensure gpu_indices is accessible (capture from global scope)
     global gpu_indices
     if 'gpu_indices' not in globals() or gpu_indices is None:
@@ -2342,7 +2349,8 @@ def _train_chess_model_core(text, checkpoint_data=None):
         for model_gpu in models:
             model_gpu.train()
 
-        for epoch in range(start_epoch, num_epochs):
+        epoch = start_epoch
+        while epoch < num_epochs:
             epoch_loss = 0.0
             epoch_batches = 0
 
@@ -2360,6 +2368,8 @@ def _train_chess_model_core(text, checkpoint_data=None):
 
             print(f"DataLoader length: {len(data_loader)}, Epoch: {epoch+1}/{num_epochs}")
 
+            _batch_interrupted = False
+            _new_data = False
             for batch_idx, (x, y, y_roles) in enumerate(data_loader):
                 if epoch == start_epoch and batch_idx < start_batch:
                     continue
@@ -2507,6 +2517,29 @@ def _train_chess_model_core(text, checkpoint_data=None):
                         torch.cuda.set_device(gpu_idx)
                         torch.cuda.empty_cache()
 
+                # Check for training interrupt (Ctrl+C)
+                if _interrupt_requested[0]:
+                    _interrupt_requested[0] = False
+                    new_ds = _handle_training_interrupt(dataset, block_size, move_to_idx)
+                    if new_ds is not None:
+                        dataset = new_ds
+                        _new_data = True
+                    _batch_interrupted = True
+                    break
+
+            # Handle interrupt after batch loop
+            if _batch_interrupted:
+                if _new_data:
+                    epoch = 0
+                    start_epoch = 0
+                    start_batch = 0
+                    epoch_losses = []
+                    running_loss = 0.0
+                    total_batches = 0
+                    continue
+                else:
+                    break
+
             # Epoch summary
             avg_epoch_loss = epoch_loss / epoch_batches if epoch_batches > 0 else 0
             epoch_losses.append(avg_epoch_loss)
@@ -2521,6 +2554,8 @@ def _train_chess_model_core(text, checkpoint_data=None):
 
             # Schedulers are now stepped every 100 batches, not per epoch
 
+            epoch += 1
+
     else:
         # Single GPU training loop (original)
         model.train()
@@ -2532,7 +2567,8 @@ def _train_chess_model_core(text, checkpoint_data=None):
 
         # Continuous plateau detection in groups of 20 × 100-batch averages
 
-        for epoch in range(start_epoch, num_epochs):
+        epoch = start_epoch
+        while epoch < num_epochs:
             epoch_loss = 0.0
             epoch_batches = 0
             # Create a fresh dataloader for each epoch to allow proper shuffling
@@ -2549,6 +2585,8 @@ def _train_chess_model_core(text, checkpoint_data=None):
 
             print(f"DataLoader length: {len(data_loader)}, Epoch: {epoch+1}/{num_epochs}")
 
+            _batch_interrupted = False
+            _new_data = False
             for batch_idx, (x, y, y_roles) in enumerate(data_loader):
                     # Skip batches if resuming from checkpoint
                     if epoch == start_epoch and batch_idx < start_batch:
@@ -2722,6 +2760,29 @@ def _train_chess_model_core(text, checkpoint_data=None):
                             if is_blackwell:
                                 torch.cuda.empty_cache()
 
+                    # Check for training interrupt (Ctrl+C)
+                    if _interrupt_requested[0]:
+                        _interrupt_requested[0] = False
+                        new_ds = _handle_training_interrupt(dataset, block_size, move_to_idx)
+                        if new_ds is not None:
+                            dataset = new_ds
+                            _new_data = True
+                        _batch_interrupted = True
+                        break
+
+            # Handle interrupt after batch loop
+            if _batch_interrupted:
+                if _new_data:
+                    epoch = 0
+                    start_epoch = 0
+                    start_batch = 0
+                    epoch_losses = []
+                    running_loss = 0.0
+                    total_batches = 0
+                    continue
+                else:
+                    break
+
             # Epoch summary
             avg_epoch_loss = epoch_loss / epoch_batches if epoch_batches > 0 else 0
             epoch_losses.append(avg_epoch_loss)
@@ -2740,6 +2801,11 @@ def _train_chess_model_core(text, checkpoint_data=None):
 
             # Scheduler is now stepped every 100 batches, not per epoch
 
+            epoch += 1
+
+    # Restore original signal handler
+    signal.signal(signal.SIGINT, _old_sigint)
+
     # Final training summary
     if epoch_losses:
         initial_loss = epoch_losses[0]
@@ -2755,53 +2821,48 @@ def _train_chess_model_core(text, checkpoint_data=None):
 
 
 # Main training function
+def _handle_training_interrupt(dataset, block_size, move_to_idx):
+    """Handle Ctrl+C during training. Returns new dataset or None to quit."""
+    print("\n\n" + "=" * 50)
+    print("Training interrupted! (Ctrl+C)")
+    print("=" * 50)
+    print("\nOptions:")
+    print("  n = Pick a new training data file (keep model & optimizer)")
+    print("  q = Quit")
+    try:
+        choice = input("\nChoice (n/q): ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        return None
+
+    if choice == 'n':
+        print("\nSelect new training data file...")
+        file_path = create_file_dialog(
+            title="Select New Chess Games File", filetypes=[("Text files", "*.txt")])
+        if not file_path:
+            print("No file selected. Quitting.")
+            return None
+
+        print(f"Loading chess file: {file_path}")
+        with open(file_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+        games = text.split('\n\n')
+        games = ['<STARTGAME>' + ' ' + game.strip() + ' ' + '<EOFG>'
+                 for game in games if game.strip()]
+        text = '\n'.join(games)
+        print(f"New dataset loaded. Games: {len(games)}, Characters: {len(text)}")
+
+        new_dataset = ChessMovesDataset(text, block_size, move_to_idx)
+        print(f"New dataset: {len(new_dataset)} sequences")
+        print("Continuing training with same model & optimizer...\n")
+        return new_dataset
+
+    return None
+
+
 def train_chess_model():
     """Main training entry point. Ctrl+C during training lets you pick a new data file."""
     text, checkpoint_data = load_data_interactive()
-
-    while True:
-        try:
-            _train_chess_model_core(text, checkpoint_data)
-            break  # Training completed normally
-        except KeyboardInterrupt:
-            print("\n\n" + "=" * 50)
-            print("Training interrupted! (Ctrl+C)")
-            print("=" * 50)
-            print("\nOptions:")
-            print("  n = Pick a new training data file (keep current model)")
-            print("  q = Quit")
-            try:
-                choice = input("\nChoice (n/q): ").strip().lower()
-            except (KeyboardInterrupt, EOFError):
-                print("\nQuitting.")
-                break
-
-            if choice == 'n':
-                # Pick new file, keep model by loading the last saved checkpoint
-                print("\nSelect new training data file...")
-                file_path = create_file_dialog(
-                    title="Select New Chess Games File", filetypes=[("Text files", "*.txt")])
-                if not file_path:
-                    print("No file selected. Quitting.")
-                    break
-
-                print(f"Loading chess file: {file_path}")
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    text = f.read()
-                games = text.split('\n\n')
-                games = ['<STARTGAME>' + ' ' + game.strip() + ' ' + '<EOFG>'
-                         for game in games if game.strip()]
-                text = '\n'.join(games)
-                print(f"New dataset loaded. Games: {len(games)}, Characters: {len(text)}")
-
-                # Load the most recent checkpoint to continue from
-                checkpoint_data = load_model_file()
-                if checkpoint_data is None:
-                    print("No checkpoint found. Starting fresh.")
-                print("\nRestarting training with new data...\n")
-            else:
-                print("Quitting.")
-                break
+    _train_chess_model_core(text, checkpoint_data)
 
 
 def load_data_interactive():
