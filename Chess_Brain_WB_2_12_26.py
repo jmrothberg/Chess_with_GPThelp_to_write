@@ -939,8 +939,16 @@ class ChessMovesDataset(Dataset):
     def _tokenize_text(self, text):
         """Sequential tokenization: parse text into 4-token-per-ply sequences."""
         ply = 0  # Ply counter within current game (reset at STARTGAME)
+        text_len = len(text)
+        next_progress = text_len // 20  # Print every 5%
+        print(f"Tokenizing {text_len:,} characters...")
         i = 0
-        while i < len(text):
+        while i < text_len:
+            if i >= next_progress:
+                pct = i * 100 // text_len
+                print(f"  Tokenizing... {pct}% ({i:,}/{text_len:,} chars, {len(self.tokens):,} tokens)")
+                next_progress += text_len // 20
+
             if text[i:i+11] == '<STARTGAME>':
                 self.tokens.append(STARTGAME)
                 self.roles.append(ROLE_SPECIAL)
