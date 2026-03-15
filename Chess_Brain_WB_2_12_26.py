@@ -284,8 +284,7 @@ class MultiHeadAttention(nn.Module):
         if use_rope:
             self.rotary = RotaryEmbedding(head_size)
 
-        if self.flash_available:
-            print(f"Using Flash Attention {'with RoPE' if use_rope else ''}")
+        # Flash attention availability logged at model level, not per-layer
 
     def apply_rotary_pos_emb(self, q, k, cos, sin):
         # Apply rotary embeddings to queries and keys
@@ -446,8 +445,7 @@ class MultiQueryAttention(nn.Module):
         self.register_buffer('causal_mask', torch.tril(torch.ones(1024, 1024)))
         self.flash_available = hasattr(F, 'scaled_dot_product_attention')
 
-        if self.flash_available:
-            print("Using Flash Attention in MultiQueryAttention")
+        # Flash attention availability logged at model level, not per-layer
 
     def forward(self, x, mask=None):
         B, T, C = x.size()
@@ -752,6 +750,11 @@ class ChessModel(nn.Module):
         # (due to autoregressive shift). We add an embedding of FROM to the
         # hidden state before the TO head.
         self.emb_from = nn.Embedding(64, n_embd)
+
+        # Log flash attention once
+        flash_available = hasattr(F, 'scaled_dot_product_attention')
+        if flash_available:
+            print(f"Flash Attention enabled ({n_layer} layers, {n_head} heads, {n_kv_heads} KV heads)")
 
         # Initialize weights
         self.apply(self._init_weights)
@@ -1665,116 +1668,83 @@ def select_gpus():
         return all_gpus
 
 
-def enter_batch_size(n_embd, n_head, block_size, n_layer, batch_size, gpu_indices):
-    """Calculate conservative batch size for stable chess training (prevents crashes)"""
+def enter_batch_size(n_embd, n_head, block_size, n_layer, batch_size, gpu_indices, n_kv_heads=None):
+    """Calculate batch size based on GPU memory and model architecture."""
     bytes_per_float = 4
     num_gpus = len(gpu_indices)
 
-    # Conservative GPU optimizations for stability with VNC/Cinnamon
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        print(f"\n🎯 Conservative GPU Optimization for {gpu_name}")
-        # Use conservative settings to prevent crashes with display conflicts
-        safety_factor = 0.85  # Conservative safety factor for all GPUs
-        memory_efficiency = 0.90  # Standard memory efficiency
-    else:
-        print("\n💻 CPU Mode")
-        safety_factor = 0.95  # Very conservative for CPU
-        memory_efficiency = 0.85
-
-    if torch.cuda.is_available() and len(gpu_indices) > 0:
-        gpu_memory = sum(torch.cuda.get_device_properties(i).total_memory for i in gpu_indices)
-    else:
-        gpu_memory = 64 * 1024**3  # Default CPU memory estimate
-
-    # Memory calculations optimized for chess model
-    vocab_size = ROLE_VOCAB_SIZE
-    token_embeddings = vocab_size * n_embd * bytes_per_float
-    position_embeddings = block_size * n_embd * bytes_per_float
-
-    # Chess model uses true GQA (Grouped Query Attention) - calculate correct memory usage
     head_dim = n_embd // n_head
-    n_kv_heads = max(1, n_head // 4)  # GQA ratio, but use actual passed value if available
+    if n_kv_heads is None:
+        n_kv_heads = max(1, n_head // 4)
 
-    # Attention weights: Q_proj + K_proj + V_proj + out_proj
-    q_proj = n_embd * n_embd  # Q projection: n_embd -> n_embd
-    kv_proj = n_embd * n_kv_heads * head_dim * 2  # K,V projections: n_embd -> n_kv_heads * head_dim each
-    out_proj = n_embd * n_embd  # Output projection: n_embd -> n_embd
-    attention_weights_per_layer = (q_proj + kv_proj + out_proj) * bytes_per_float
-    attention_weights = n_layer * attention_weights_per_layer
+    # --- Model static memory (per GPU replica) ---
+    vocab_size = ROLE_VOCAB_SIZE
+    token_emb = vocab_size * n_embd
+    pos_emb = block_size * n_embd
+    attn_per_layer = n_embd * n_embd + n_embd * n_kv_heads * head_dim * 2 + n_embd * n_embd  # Q+KV+Out
+    ffn_per_layer = 12 * n_embd * n_embd  # SwiGLU: 3 matrices x (n_embd x 4*n_embd)
+    rms_per_layer = 2 * n_embd
+    total_params = token_emb + pos_emb + n_layer * (attn_per_layer + ffn_per_layer + rms_per_layer)
 
-    feedforward_weights = n_layer * 4 * n_embd * n_embd * bytes_per_float  # SwiGLU (w1,w2,w3)
-    rms_norm_weights = n_layer * 2 * n_embd * bytes_per_float  # RMSNorm per block (2 per layer)
+    model_bytes = total_params * bytes_per_float
+    optimizer_bytes = model_bytes * 2  # Adam: momentum + variance
+    gradient_bytes = model_bytes
+    static_per_gpu = model_bytes + optimizer_bytes + gradient_bytes
 
-    total_model_params = token_embeddings + position_embeddings + attention_weights + feedforward_weights + rms_norm_weights
+    # --- Per-sequence activation memory ---
+    # Stored per layer: checkpoint input (FP16) + backward gradient (FP32)
+    stored_per_layer = block_size * n_embd * (2 + bytes_per_float)
+    stored_total = n_layer * stored_per_layer
 
-    optimizer_memory = total_model_params * 2  # Adam optimizer
-    gradient_memory = total_model_params
+    # Peak recompute (one layer at a time): attention + SwiGLU FFN intermediates (FP16)
+    attn_peak = block_size * n_embd * 4 * 2       # Q, K, V, output
+    ffn_peak = block_size * (4 * n_embd) * 3 * 2  # gate, up, product
+    recompute_peak = attn_peak + ffn_peak
 
-    # Activations per sequence (chess model with gradient checkpointing)
-    # Gradient checkpointing significantly reduces memory by recomputing forward pass during backprop
-    # Only essential activations (embeddings, attention outputs) are stored
+    # Embeddings
+    embedding_mem = block_size * n_embd * 2 * 2
 
-    # Input embeddings (token + position) - always stored
-    embedding_activations = block_size * n_embd * bytes_per_float * 2
+    raw_per_seq = embedding_mem + stored_total + recompute_peak
 
-    # Attention computation requires storing Q,K,V for backprop, but with checkpointing this is minimized
-    # Approximate attention memory per layer (conservative estimate)
-    attention_per_layer = block_size * n_embd * bytes_per_float * 3  # Q,K,V projections
-    attention_activations = n_layer * attention_per_layer
+    # Practical overhead: autograd graph, caching allocator fragmentation,
+    # torch.compile kernel cache, temporary tensors, mixed precision buffers
+    total_per_seq = int(raw_per_seq * 4.0)
 
-    # Feedforward activations - checkpointed, so minimal storage
-    ff_per_layer = block_size * n_embd * bytes_per_float * 2  # Input and output of FF
-    ff_activations = n_layer * ff_per_layer
-
-    # Gradient checkpointing provides significant memory savings
-    # Estimate: 50-70% reduction in activation memory during training
-    checkpointing_savings = 0.6  # 60% reduction
-    total_per_seq = (embedding_activations + attention_activations + ff_activations) * (1 - checkpointing_savings) * memory_efficiency
-
-    # Adjust for multi-GPU setup
-    if num_gpus > 1:
-        # DataParallel replicates model on each GPU
-        total_model_params *= num_gpus
-        optimizer_memory *= num_gpus
-        gradient_memory *= num_gpus
-        # But activations are split across GPUs
-        total_per_seq = total_per_seq / num_gpus
-
-    available_memory = gpu_memory * safety_factor - (total_model_params + optimizer_memory + gradient_memory)
-    max_batch_size = max(1, int(available_memory / total_per_seq))
-
-    print(f"\n🧠 Conservative Memory Analysis for {num_gpus} GPU{'s' if num_gpus > 1 else ''} (crash prevention):")
-    print(f"- Model parameters: {total_model_params / 1e9:.2f} GB")
-    print(f"- Optimizer memory: {optimizer_memory / 1e9:.2f} GB")
-    print(f"- Gradient memory: {gradient_memory / 1e9:.2f} GB")
-    print(f"- Memory per sequence: {total_per_seq / 1e6:.2f} MB")
-    print(f"- Total GPU memory: {gpu_memory / 1e9:.1f} GB")
-    print(f"- Available memory: {available_memory / 1e9:.2f} GB")
-
-    if num_gpus == 1:
-        print(f"✅ Single GPU - Maximum batch size: {max_batch_size}")
-
-        # Optimized batch size recommendations for Blackwell GB10 (128GB unified memory)
-        if torch.cuda.is_available():
-            # Blackwell GB10 has 128GB unified memory - can handle large batches
-            # Chess models are memory-efficient due to optimized architecture
-            recommended_batch = min(max_batch_size, 256)  # Optimized for Blackwell performance
-        else:
-            recommended_batch = min(max_batch_size, 32)  # CPU training
-
+    # --- GPU memory: use actual free memory (accounts for desktop/display processes) ---
+    if torch.cuda.is_available() and len(gpu_indices) > 0:
+        print(f"\n  GPU memory (actual free):")
+        gpu_free = []
+        for i in gpu_indices:
+            free, total = torch.cuda.mem_get_info(i)
+            other_used = total - free
+            gpu_free.append(free)
+            if other_used > 100 * 1024**2:  # >100MB used by other processes
+                print(f"    GPU {i}: {free/1e9:.1f} GB free / {total/1e9:.1f} GB total ({other_used/1e9:.1f} GB used by other processes)")
+            else:
+                print(f"    GPU {i}: {free/1e9:.1f} GB free / {total/1e9:.1f} GB total")
+        # Bottleneck = GPU with least free memory (usually the display GPU)
+        per_gpu_free = min(gpu_free)
     else:
-        print(f"⚠️  Multi-GPU DataParallel - Maximum batch size per GPU: {max_batch_size}")
-        print("Note: DataParallel may freeze. Consider using single GPU for better reliability.")
+        per_gpu_free = 64 * 1024**3
 
-        # Optimized recommendations for multi-GPU Blackwell setup
-        if torch.cuda.is_available():
-            # Blackwell GB10 GPUs have 128GB each - can handle large batches
-            recommended_batch = min(max_batch_size, 128)  # Optimized for multi-Blackwell performance
-        else:
-            recommended_batch = min(max_batch_size, 16)  # CPU multi-processing
+    per_gpu_available = per_gpu_free * 0.90 - static_per_gpu  # 90% of free, minus static
+    max_seqs_per_gpu = max(1, int(per_gpu_available / total_per_seq))
+    max_batch_size = max_seqs_per_gpu * num_gpus
 
-    batch_size = int(get_input_with_default(f"Enter batch size (recommended: {recommended_batch}, max: {max_batch_size}): ", recommended_batch))
+    print(f"\n  Memory estimate:")
+    print(f"    Model + optimizer + gradients per GPU: {static_per_gpu / 1e9:.2f} GB")
+    print(f"    Activation memory per sequence: {total_per_seq / 1e6:.0f} MB")
+    print(f"    Bottleneck GPU free: {per_gpu_free / 1e9:.1f} GB")
+    print(f"    Available for activations: {per_gpu_available / 1e9:.1f} GB")
+    print(f"    Max batch size: {max_batch_size} ({max_seqs_per_gpu} per GPU x {num_gpus} GPUs)")
+
+    # Recommend 75% of max for safety
+    recommended_batch = max(1, (max_batch_size * 3 // 4))
+    # Round down to nearest multiple of num_gpus for even splits
+    recommended_batch = (recommended_batch // num_gpus) * num_gpus
+    recommended_batch = max(num_gpus, recommended_batch)
+
+    batch_size = int(get_input_with_default(f"Enter batch size (recommended: {recommended_batch}, max: {max_batch_size})", recommended_batch))
     batch_size = max(1, min(batch_size, max_batch_size))
 
     return batch_size
@@ -1893,9 +1863,9 @@ def _train_chess_model_core(text, checkpoint_data=None):
 
         # Ask for training parameters (use checkpoint values as defaults where available)
         # These can be safely changed without breaking the model
+        # Calculate recommended batch size from GPU memory (model already loaded)
         saved_batch_size = checkpoint_hyperparams.get('batch_size', 256)
-        print(f"Note: Changing batch size may affect training resumption accuracy")
-        batch_size = int(get_input_with_default("Batch size", saved_batch_size))
+        batch_size = enter_batch_size(n_embd, n_head, block_size, n_layer, saved_batch_size, gpu_indices, n_kv_heads)
         num_epochs = int(get_input_with_default("Number of epochs", 20))
 
         # Learning rate and weight decay can be adjusted (will be loaded from optimizer state)
@@ -1946,7 +1916,6 @@ def _train_chess_model_core(text, checkpoint_data=None):
         block_size = int(get_input_with_default("Sequence length", block_size))
         n_layer = int(get_input_with_default("Number of layers", n_layer))
         dropout = float(get_input_with_default("Dropout", dropout))
-        batch_size = int(get_input_with_default("Batch size", batch_size))
         num_epochs = int(get_input_with_default("Number of epochs", num_epochs))
 
         # Ensure n_embd is divisible by n_head
@@ -1962,7 +1931,12 @@ def _train_chess_model_core(text, checkpoint_data=None):
         model = ChessModel(vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout, use_chess=True)
         model.start_game_token = move_to_idx['<STARTGAME>']
 
-        print(f"Model created with {sum(p.numel() for p in model.parameters()):,} parameters")
+        num_params = sum(p.numel() for p in model.parameters())
+        model_size_mb = num_params * 4 / 1e6
+        print(f"Model created with {num_params:,} parameters ({model_size_mb:.0f} MB)")
+
+        # Calculate recommended batch size based on actual model and GPU memory
+        batch_size = enter_batch_size(n_embd, n_head, block_size, n_layer, batch_size, gpu_indices, n_kv_heads)
 
     # Choose optimizer and scheduler early - needed for both single and multi-GPU setups
     clip_threshold = CHESS_DEFAULTS['max_norm']
@@ -2135,31 +2109,48 @@ def _train_chess_model_core(text, checkpoint_data=None):
                 scheduler_state_dict = checkpoint_data[9]  # scheduler states (list for multi-GPU)
                 scaler_state_dict = checkpoint_data[10]    # scaler states (list for multi-GPU)
 
-                if isinstance(optimizer_state_dict, list) and len(optimizer_state_dict) == len(optimizers):
-                    print(f"Loading {len(optimizer_state_dict)} optimizer states for {len(optimizers)} GPUs")
-                    for i, opt_state in enumerate(optimizer_state_dict):
-                        try:
-                            optimizers[i].load_state_dict(opt_state)
-                            print(f"  GPU {gpu_indices[i]}: optimizer state loaded")
+                # Handle both single optimizer state (new format) and list (old format)
+                if isinstance(optimizer_state_dict, list):
+                    # Old format: one state per GPU
+                    opt_states = optimizer_state_dict
+                else:
+                    # New format: single state, replicate to all GPUs
+                    opt_states = [optimizer_state_dict] * len(optimizers)
 
-                            # Always reset LR when switching to cosine scheduler (multi-GPU)
-                            if scheduler_choice == 'cosine':
-                                optimizers[i].param_groups[0]['lr'] = learning_rate
-                                print(f"  GPU {gpu_indices[i]}: reset LR to {learning_rate} for cosine scheduler")
-                        except ValueError as e:
-                            if "parameter group" in str(e):
-                                print(f"  ⚠️  GPU {gpu_indices[i]}: Optimizer state incompatible (likely PyTorch version change)")
-                                print(f"     Continuing with fresh optimizer state (this is normal after PyTorch updates)")
-                            else:
-                                raise e
+                print(f"Loading optimizer state for {len(optimizers)} GPUs")
+                for i, opt_state in enumerate(opt_states):
+                    if opt_state is None:
+                        continue
+                    try:
+                        optimizers[i].load_state_dict(opt_state)
+                        print(f"  GPU {gpu_indices[i]}: optimizer state loaded")
+
+                        # Always reset LR when switching to cosine scheduler (multi-GPU)
+                        if scheduler_choice == 'cosine':
+                            optimizers[i].param_groups[0]['lr'] = learning_rate
+                            print(f"  GPU {gpu_indices[i]}: reset LR to {learning_rate} for cosine scheduler")
+                    except ValueError as e:
+                        if "parameter group" in str(e):
+                            print(f"  ⚠️  GPU {gpu_indices[i]}: Optimizer state incompatible (likely PyTorch version change)")
+                            print(f"     Continuing with fresh optimizer state (this is normal after PyTorch updates)")
+                        else:
+                            raise e
 
                 # Always start with fresh scheduler states when loading checkpoint
                 # This allows switching scheduler types (e.g., cosine → plateau) for stuck runs
                 print(f"🔄 Using fresh {scheduler_choice} schedulers for all GPUs (allows switching types for stuck runs)")
 
-                if isinstance(scaler_state_dict, list) and len(scaler_state_dict) == len(scalers):
-                    print(f"Loading {len(scaler_state_dict)} scaler states for {len(scalers)} GPUs")
-                    for i, scal_state in enumerate(scaler_state_dict):
+                # Handle both single scaler state (new format) and list (old format)
+                if isinstance(scaler_state_dict, list):
+                    scal_states = scaler_state_dict
+                else:
+                    scal_states = [scaler_state_dict] * len(scalers) if scaler_state_dict else []
+
+                if scal_states:
+                    print(f"Loading scaler state for {len(scalers)} GPUs")
+                    for i, scal_state in enumerate(scal_states):
+                        if scal_state is None:
+                            continue
                         try:
                             scalers[i].load_state_dict(scal_state)
                             print(f"  GPU {gpu_indices[i]}: scaler state loaded")
@@ -2506,14 +2497,10 @@ def _train_chess_model_core(text, checkpoint_data=None):
                         models[0], x_splits[0].to(f'cuda:0'), 50, all_text, idx_to_move
                     )
 
-                    # Save using first model and ALL optimizer/scheduler states
-                    all_optimizer_states = [opt.state_dict() for opt in optimizers]
-                    all_scheduler_states = [sched.state_dict() for sched in schedulers]
-                    all_scaler_states = [scal.state_dict() for scal in scalers]
-
+                    # Save using first model and first optimizer only (all GPUs are synchronized)
                     save_model_all(
                         models[0], all_text, n_embd, n_head, n_kv_heads, n_layer, dropout,
-                        block_size, epoch, batch_idx, batch_size, all_optimizer_states, all_scheduler_states, all_scaler_states, avg_loss,
+                        block_size, epoch, batch_idx, batch_size, optimizers[0], schedulers[0], scalers[0], avg_loss,
                         learning_rate, weight_decay, gpu_indices
                     )
 
