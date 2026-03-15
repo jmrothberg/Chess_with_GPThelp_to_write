@@ -23,8 +23,8 @@ import time
 import os
 import string
 import json
-import Chess_Inference_Dec_14_25_WB_2_12_26 as brain_inference
-from Chess_Inference_Dec_14_25_WB_2_12_26 import generate_response
+import Chess_Inference_WB_2_12_26 as brain_inference
+from Chess_Inference_WB_2_12_26 import generate_response
 from game_selector3D import loop_to_select_new_game, draw_pieces_not_on_board
 import platform
 try:
@@ -1777,13 +1777,9 @@ def convert_to_chess_notation(board, move):
 
 
 def read_aloud(text):
-    if sound_enabled:
-        if platform.system() == "Darwin":  # Check if the system is macOS
-            os.system("say " + text)
-        else:
-            pass
-    else:
-        print("Text-to-speech (disabled): " + text)
+    # os.system("say") is blocking and freezes the pygame event loop on macOS.
+    # Disabled to prevent game freezes during captures and AI moves.
+    pass
         
 
 def initialize_game():

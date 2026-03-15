@@ -78,7 +78,12 @@ Thumbs.db
 
 # Chess datasets (too large for git)
 Chess_games_old_txt/
+Chess_Games_txt/
 Saved Games/
 chess_parquet/
 chess_txt_promotion_win/
 combined_chess_datasets/
+
+# Model files (too large for git)
+*.pth
+*.whl
