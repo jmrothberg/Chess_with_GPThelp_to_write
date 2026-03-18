@@ -2369,6 +2369,7 @@ def _train_chess_model_core(text, checkpoint_data=None):
 
             _batch_interrupted = False
             _new_data = False
+            _quit_training = False
             for batch_idx, (x, y, y_roles) in enumerate(data_loader):
                 if epoch == start_epoch and batch_idx < start_batch:
                     continue
@@ -2515,16 +2516,29 @@ def _train_chess_model_core(text, checkpoint_data=None):
                 # Check for training interrupt (Ctrl+C)
                 if _interrupt_requested[0]:
                     _interrupt_requested[0] = False
-                    new_ds = _handle_training_interrupt(dataset, block_size, move_to_idx)
-                    if new_ds is not None:
-                        dataset = new_ds
+                    current_lr = optimizers[0].param_groups[0]['lr']
+                    result = _handle_training_interrupt(dataset, block_size, move_to_idx, current_lr)
+                    if result is None:
+                        _batch_interrupted = True
+                        _quit_training = True
+                        break
+                    # Apply LR change to all optimizers
+                    if result['lr'] is not None:
+                        for opt in optimizers:
+                            for pg in opt.param_groups:
+                                pg['lr'] = result['lr']
+                        print(f"Learning rate updated to {result['lr']:.2e} on all {len(optimizers)} GPUs")
+                    if result['dataset'] is not None:
+                        dataset = result['dataset']
                         _new_data = True
                     _batch_interrupted = True
                     break
 
             # Handle interrupt after batch loop
             if _batch_interrupted:
-                if _new_data:
+                if _quit_training:
+                    break
+                elif _new_data:
                     epoch = 0
                     start_epoch = 0
                     start_batch = 0
@@ -2533,7 +2547,8 @@ def _train_chess_model_core(text, checkpoint_data=None):
                     total_batches = 0
                     continue
                 else:
-                    break
+                    # LR-only change: continue from current position
+                    continue
 
             # Epoch summary
             avg_epoch_loss = epoch_loss / epoch_batches if epoch_batches > 0 else 0
@@ -2582,6 +2597,7 @@ def _train_chess_model_core(text, checkpoint_data=None):
 
             _batch_interrupted = False
             _new_data = False
+            _quit_training = False
             for batch_idx, (x, y, y_roles) in enumerate(data_loader):
                     # Skip batches if resuming from checkpoint
                     if epoch == start_epoch and batch_idx < start_batch:
@@ -2758,16 +2774,28 @@ def _train_chess_model_core(text, checkpoint_data=None):
                     # Check for training interrupt (Ctrl+C)
                     if _interrupt_requested[0]:
                         _interrupt_requested[0] = False
-                        new_ds = _handle_training_interrupt(dataset, block_size, move_to_idx)
-                        if new_ds is not None:
-                            dataset = new_ds
+                        current_lr = optimizer.param_groups[0]['lr']
+                        result = _handle_training_interrupt(dataset, block_size, move_to_idx, current_lr)
+                        if result is None:
+                            _batch_interrupted = True
+                            _quit_training = True
+                            break
+                        # Apply LR change
+                        if result['lr'] is not None:
+                            for pg in optimizer.param_groups:
+                                pg['lr'] = result['lr']
+                            print(f"Learning rate updated to {result['lr']:.2e}")
+                        if result['dataset'] is not None:
+                            dataset = result['dataset']
                             _new_data = True
                         _batch_interrupted = True
                         break
 
             # Handle interrupt after batch loop
             if _batch_interrupted:
-                if _new_data:
+                if _quit_training:
+                    break
+                elif _new_data:
                     epoch = 0
                     start_epoch = 0
                     start_batch = 0
@@ -2776,7 +2804,8 @@ def _train_chess_model_core(text, checkpoint_data=None):
                     total_batches = 0
                     continue
                 else:
-                    break
+                    # LR-only change: continue from current position
+                    continue
 
             # Epoch summary
             avg_epoch_loss = epoch_loss / epoch_batches if epoch_batches > 0 else 0
@@ -2816,42 +2845,59 @@ def _train_chess_model_core(text, checkpoint_data=None):
 
 
 # Main training function
-def _handle_training_interrupt(dataset, block_size, move_to_idx):
-    """Handle Ctrl+C during training. Returns new dataset or None to quit."""
+def _handle_training_interrupt(dataset, block_size, move_to_idx, current_lr=None):
+    """Handle Ctrl+C during training. Returns dict with 'dataset' and 'lr' keys, or None to quit."""
     print("\n\n" + "=" * 50)
     print("Training interrupted! (Ctrl+C)")
     print("=" * 50)
-    print("\nOptions:")
-    print("  n = Pick a new training data file (keep model & optimizer)")
-    print("  q = Quit")
+
+    result = {'dataset': None, 'lr': None}
+
     try:
-        choice = input("\nChoice (n/q): ").strip().lower()
+        # Always offer LR change
+        if current_lr is not None:
+            print(f"\nCurrent learning rate: {current_lr:.2e}")
+        lr_input = input("New learning rate (or Enter to keep current): ").strip()
+        if lr_input:
+            try:
+                result['lr'] = float(lr_input)
+                print(f"Learning rate will change to: {result['lr']:.2e}")
+            except ValueError:
+                print("Invalid LR, keeping current.")
+
+        # Always offer data file change
+        choice = input("Load new training data file? (y/n/q=quit): ").strip().lower()
     except (KeyboardInterrupt, EOFError):
         return None
 
-    if choice == 'n':
+    if choice == 'q':
+        return None
+
+    if choice == 'y':
         print("\nSelect new training data file...")
         file_path = create_file_dialog(
             title="Select New Chess Games File", filetypes=[("Text files", "*.txt")])
         if not file_path:
-            print("No file selected. Quitting.")
-            return None
+            print("No file selected.")
+        else:
+            print(f"Loading chess file: {file_path}")
+            with open(file_path, 'r', encoding='utf-8') as f:
+                text = f.read()
+            games = text.split('\n\n')
+            games = ['<STARTGAME>' + ' ' + game.strip() + ' ' + '<EOFG>'
+                     for game in games if game.strip()]
+            text = '\n'.join(games)
+            print(f"New dataset loaded. Games: {len(games)}, Characters: {len(text)}")
 
-        print(f"Loading chess file: {file_path}")
-        with open(file_path, 'r', encoding='utf-8') as f:
-            text = f.read()
-        games = text.split('\n\n')
-        games = ['<STARTGAME>' + ' ' + game.strip() + ' ' + '<EOFG>'
-                 for game in games if game.strip()]
-        text = '\n'.join(games)
-        print(f"New dataset loaded. Games: {len(games)}, Characters: {len(text)}")
+            result['dataset'] = ChessMovesDataset(text, block_size, move_to_idx)
+            print(f"New dataset: {len(result['dataset'])} sequences")
 
-        new_dataset = ChessMovesDataset(text, block_size, move_to_idx)
-        print(f"New dataset: {len(new_dataset)} sequences")
-        print("Continuing training with same model & optimizer...\n")
-        return new_dataset
-
-    return None
+    # If nothing changed, still return result (not None) so training continues
+    if result['dataset'] is None and result['lr'] is None:
+        print("No changes. Continuing training...\n")
+    else:
+        print("Continuing training...\n")
+    return result
 
 
 def train_chess_model():
