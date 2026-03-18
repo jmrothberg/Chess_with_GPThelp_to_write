@@ -809,16 +809,15 @@ class ChessModel(nn.Module):
 
             label_smoothing = getattr(self, 'label_smoothing', 0.0)
 
-            # Upweight COLOR and PROMO so their gradients match FROM/TO magnitude.
-            # Initial CE: color=ln(2)≈0.69, from/to=ln(64)≈4.16, promo=ln(5)≈1.61
-            # Without weighting, backbone ignores color signal (6x weaker).
-            # We scale UP weak heads to match FROM/TO, leaving FROM/TO untouched.
-            w_color = 4.1589 / 0.6931   # ln(64)/ln(2) ≈ 6.0
-            w_promo = 4.1589 / 1.6094   # ln(64)/ln(5) ≈ 2.6
+            # Loss weights: prioritize FROM/TO (the actual chess decisions).
+            # COLOR is trivially predictable (alternates W/B) — low weight avoids
+            # stealing backbone capacity from FROM/TO where it matters.
+            w_color = 0.5
+            w_promo = 1.0
 
             losses = []
 
-            # COLOR loss (upweighted 6x to match FROM/TO gradient scale)
+            # COLOR loss (downweighted — trivially predictable, don't waste capacity)
             if color_mask.any():
                 color_logits = self.head_color(h[color_mask])
                 color_targets = targets_flat[color_mask] - COLOR_OFFSET
@@ -847,7 +846,7 @@ class ChessModel(nn.Module):
                                           label_smoothing=label_smoothing)
                 losses.append(loss_to)
 
-            # PROMO loss (upweighted 2.6x to match FROM/TO gradient scale)
+            # PROMO loss (equal weight — mostly "none" predictions)
             if promo_mask.any():
                 promo_logits = self.head_promo(h[promo_mask])
                 promo_targets = targets_flat[promo_mask] - PROMO_OFFSET
