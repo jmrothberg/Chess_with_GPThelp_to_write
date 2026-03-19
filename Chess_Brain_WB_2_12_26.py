@@ -76,12 +76,14 @@ TO VERIFY VARIABLES ARE SET:
 
 import os
 import platform
+import re
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import math
 import signal
 import sys
+import pandas as pd
 from datetime import datetime
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
@@ -173,7 +175,7 @@ CHESS_DEFAULTS = {
     'n_embd': 512,       # Embedding dimension (512/8=64 per head)
     'n_head': 8,         # Query heads
     'n_kv_heads': 2,     # KV heads (4:1 GQA ratio)
-    'block_size': 512,   # 4 tokens per ply: ~80 moves * 4 + specials ≈ 323 tokens
+    'block_size': 512,   # 4-token mode default (512/4=128 half-moves=64 full moves)
     'n_layer': 12,       # Transformer layers - deeper for tactical depth
     'dropout': 0.0,      # No dropout - Stockfish games are deterministic, no noise to regularize
     'batch_size': 512,   # Split across 4 GPUs (128 per GPU) - safe for 48GB GPUs
@@ -712,12 +714,13 @@ class ChessModel(nn.Module):
         use_chess: Enable chess-specific masking (always True for ChessModel)
         use_dna: Enable DNA-specific features (always False for ChessModel)
     """
-    def __init__(self, vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout, use_chess=False, use_dna=False):
+    def __init__(self, vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout, use_chess=False, use_dna=False, token_mode='4token'):
         super().__init__()
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.use_chess = use_chess
         self.use_dna = use_dna
+        self.token_mode = token_mode  # 'classic' or '4token'
         if use_chess:
             self.start_game_token = move_to_idx['<STARTGAME>'] if 'move_to_idx' in globals() else None
 
@@ -739,17 +742,19 @@ class ChessModel(nn.Module):
         # Final RMSNorm instead of LayerNorm
         self.rms_final = RMSNorm(n_embd)
 
-        # Role-specific output heads for 4-token-per-ply grammar
-        self.head_color = nn.Linear(n_embd, 2)    # White / Black
-        self.head_from = nn.Linear(n_embd, 64)    # FROM square
-        self.head_to = nn.Linear(n_embd, 64)      # TO square
-        self.head_promo = nn.Linear(n_embd, 5)    # none / q / r / b / n
+        if token_mode == 'classic':
+            # Classic mode: single lm_head with weight tying to token embeddings
+            self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+            self.lm_head.weight = self.token_embedding_table.weight  # Weight tying
+        else:
+            # 4-token mode: Role-specific output heads for 4-token-per-ply grammar
+            self.head_color = nn.Linear(n_embd, 2)    # White / Black
+            self.head_from = nn.Linear(n_embd, 64)    # FROM square
+            self.head_to = nn.Linear(n_embd, 64)      # TO square
+            self.head_promo = nn.Linear(n_embd, 5)    # none / q / r / b / n
 
-        # FROM conditioning embedding for TO prediction
-        # When predicting TO, the input token at that position is the FROM token
-        # (due to autoregressive shift). We add an embedding of FROM to the
-        # hidden state before the TO head.
-        self.emb_from = nn.Embedding(64, n_embd)
+            # FROM conditioning embedding for TO prediction
+            self.emb_from = nn.Embedding(64, n_embd)
 
         # Log flash attention once
         flash_available = hasattr(F, 'scaled_dot_product_attention')
@@ -794,6 +799,23 @@ class ChessModel(nn.Module):
         # Final normalization
         x = self.rms_final(x)
 
+        # ===== CLASSIC MODE: standard next-token prediction =====
+        if self.token_mode == 'classic':
+            logits = self.lm_head(x)  # [B, T, vocab_size]
+            if targets is not None:
+                logits_flat = logits.view(B * T, -1)
+                targets_flat = targets.view(B * T)
+                # Ignore PAD positions (y_roles == -1 sentinel from ClassicChessMovesDataset)
+                pad_id = self.vocab_size - 3  # PAD is 3rd-to-last special token
+                label_smoothing = getattr(self, 'label_smoothing', 0.0)
+                loss = F.cross_entropy(logits_flat, targets_flat,
+                                       ignore_index=pad_id,
+                                       label_smoothing=label_smoothing)
+                return logits, loss
+            else:
+                return logits, None
+
+        # ===== 4-TOKEN MODE: role-specific heads (unchanged) =====
         # Training mode: route through role-specific heads based on target_roles
         if targets is not None and target_roles is not None:
             h = x.view(B * T, -1)           # [B*T, n_embd]
@@ -1029,6 +1051,115 @@ class ChessMovesDataset(Dataset):
         return x, y, y_roles
 
 
+class ClassicChessMovesDataset(Dataset):
+    """
+    Dataset for chess games using classic 1-token-per-move tokenization (~20K vocab).
+
+    Each chess move is a single token. Special tokens: STARTGAME, EOFG, PAD, W, D.
+    Returns (x, y, y_roles) where y_roles is all -1 (sentinel meaning 'classic mode,
+    ignore roles') for training loop compatibility.
+    """
+    def __init__(self, text, seq_length, move_to_idx):
+        self.seq_length = seq_length
+        self.move_to_idx = move_to_idx
+        self.tokens = []
+
+        self._tokenize_text(text)
+
+        # Determine PAD token
+        self.pad_token = move_to_idx['<PAD>']
+
+        # Convert to tensor
+        self.tokens_tensor = torch.tensor(self.tokens, dtype=torch.long)
+
+        # Build game start indices for __len__ / __getitem__
+        startgame_id = move_to_idx['<STARTGAME>']
+        self._game_starts = torch.nonzero(
+            self.tokens_tensor == startgame_id, as_tuple=False
+        ).flatten().tolist()
+
+        print(f"Classic tokenized {len(self.tokens)} tokens, {len(self._game_starts)} games")
+
+    def _tokenize_text(self, text):
+        """Sequential tokenization: parse text into 1-token-per-move sequences."""
+        text_len = len(text)
+        next_progress = text_len // 20
+        print(f"Classic tokenizing {text_len:,} characters...")
+        i = 0
+        while i < text_len:
+            if i >= next_progress:
+                pct = i * 100 // text_len
+                print(f"  Tokenizing... {pct}% ({i:,}/{text_len:,} chars, {len(self.tokens):,} tokens)")
+                next_progress += text_len // 20
+
+            if text[i:i+11] == '<STARTGAME>':
+                self.tokens.append(self.move_to_idx['<STARTGAME>'])
+                i += 11
+            elif text[i:i+6] == '<EOFG>':
+                self.tokens.append(self.move_to_idx['<EOFG>'])
+                i += 6
+            elif text[i:i+3] == '<W>':
+                self.tokens.append(self.move_to_idx['<W>'])
+                i += 3
+            elif text[i:i+3] == '<D>':
+                self.tokens.append(self.move_to_idx['<D>'])
+                i += 3
+            elif text[i].isspace():
+                i += 1
+            elif i + 4 <= text_len:
+                # Try 5-char promotion move first (e7e8q -> E7E8Q)
+                move_str = None
+                if i + 5 <= text_len and text[i+4].isalpha() and text[i+4].lower() in 'qrbn':
+                    candidate = text[i:i+5].upper()
+                    if (candidate[0].isalpha() and candidate[1].isdigit() and
+                            candidate[2].isalpha() and candidate[3].isdigit()):
+                        if candidate in self.move_to_idx:
+                            move_str = candidate
+                            i += 5
+
+                if move_str is None:
+                    candidate = text[i:i+4].upper()
+                    if (candidate[0].isalpha() and candidate[1].isdigit() and
+                            candidate[2].isalpha() and candidate[3].isdigit()):
+                        if candidate in self.move_to_idx:
+                            move_str = candidate
+                            i += 4
+                        else:
+                            i += 1
+                            continue
+                    else:
+                        i += 1
+                        continue
+
+                self.tokens.append(self.move_to_idx[move_str])
+            else:
+                i += 1
+
+    def __len__(self):
+        return len(self._game_starts)
+
+    def __getitem__(self, idx):
+        start_pos = self._game_starts[idx]
+        len_file = len(self.tokens_tensor)
+
+        x_end = min(start_pos + self.seq_length, len_file)
+        x_data = self.tokens_tensor[start_pos:x_end]
+
+        y_end = min(start_pos + self.seq_length + 1, len_file)
+        y_data = self.tokens_tensor[start_pos + 1:y_end]
+
+        # Padded tensors
+        x = torch.full((self.seq_length,), self.pad_token, dtype=torch.long)
+        y = torch.full((self.seq_length,), self.pad_token, dtype=torch.long)
+        # y_roles = -1 sentinel means "classic mode, no role routing"
+        y_roles = torch.full((self.seq_length,), -1, dtype=torch.long)
+
+        x[:len(x_data)] = x_data
+        y[:len(y_data)] = y_data
+
+        return x, y, y_roles
+
+
 def process_chunk_for_chess_moves(args):
     """Parallel tokenization worker for 4-token-per-ply grammar."""
     (chunk_text,) = args
@@ -1185,18 +1316,100 @@ def create_idx_to_move():
     return idx_to_move
 
 
+def create_classic_move_to_idx():
+    """Create classic ~20K vocab: 64*63*5 move tokens + 5 special.
+
+    Each move is encoded as a single token:
+      move_id = from_sq * 315 + to_offset * 5 + promo_idx
+    where to_offset compresses TO into 0..62 by skipping FROM.
+    Total: 20,160 move tokens + 5 special = 20,165.
+    """
+    m = {}
+    for from_sq in range(64):
+        from_file = chr(97 + (from_sq % 8))
+        from_rank = str(8 - (from_sq // 8))
+        for to_sq in range(64):
+            if to_sq == from_sq:
+                continue
+            to_file = chr(97 + (to_sq % 8))
+            to_rank = str(8 - (to_sq // 8))
+            to_offset = to_sq if to_sq < from_sq else (to_sq - 1)
+            for promo_idx, promo_char in enumerate(['', 'q', 'r', 'b', 'n']):
+                move_id = (from_sq * 63 * 5) + (to_offset * 5) + promo_idx
+                move_str = f"{from_file}{from_rank}{to_file}{to_rank}{promo_char}".upper()
+                m[move_str] = move_id
+    # Special tokens start after move tokens
+    for idx, token in enumerate(['<STARTGAME>', '<EOFG>', '<PAD>', '<W>', '<D>'], start=len(m)):
+        m[token] = idx
+    return m
+
+
+def create_classic_idx_to_move(classic_move_to_idx):
+    """Reverse mapping for classic tokenizer."""
+    return {idx: move for move, idx in classic_move_to_idx.items()}
+
+
+_UCI_RE = re.compile(r"^[a-h][1-8][a-h][1-8][qrbn]?$", re.IGNORECASE)
+
+
+def _result_to_token(result_str):
+    """Convert game result string to token marker."""
+    if result_str == "1-0":
+        return "<W>"
+    # Treat 0-1, 1/2-1/2, draws, and anything else as <D>
+    return "<D>"
+
+
+def _read_parquet_as_text(file_path):
+    """Read parquet file and produce same format as .txt: '<W> e2e4 e7e5...\\n\\n<D> d2d4...'"""
+    print(f"Loading parquet file: {file_path}")
+    df = pd.read_parquet(file_path, columns=['Moves', 'Result'])
+    total = len(df)
+    print(f"Found {total:,} rows, converting to text...")
+    games = []
+    skipped = 0
+    last_pct = -1
+    for i, (_, row) in enumerate(df.iterrows()):
+        # Progress update every 1%
+        pct = (i * 100) // total
+        if pct != last_pct:
+            last_pct = pct
+            print(f"\rConverting games: {pct}% ({i:,}/{total:,})", end='', flush=True)
+        moves = row.get('Moves', None)
+        if moves is None:
+            skipped += 1
+            continue
+        # Handle numpy arrays, lists, tuples, and other iterables
+        try:
+            move_list = list(moves)
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        cleaned = [str(m).strip().upper() for m in move_list if _UCI_RE.match(str(m).strip())]
+        if cleaned:
+            games.append(f"{_result_to_token(str(row.get('Result', '')).strip())} {' '.join(cleaned)}")
+        else:
+            skipped += 1
+    print(f"\rConverting games: 100% ({total:,}/{total:,})")
+    print(f"Read {len(games):,} games from parquet file ({skipped:,} skipped)")
+    return '\n\n'.join(games)
+
+
 def load_chess_file():
     """Load chess games file for training"""
     print("Please select a chess games file.")
     file_path = filedialog.askopenfilename(
         title="Select Chess Games File",
-        filetypes=[("Text files", "*.txt")]
+        filetypes=[("Chess files", "*.txt *.parquet"), ("Text files", "*.txt"), ("Parquet files", "*.parquet")]
     )
 
     if file_path:
         try:
-            with open(file_path, 'r', encoding='utf-8') as file:
-                text = file.read()
+            if file_path.lower().endswith('.parquet'):
+                text = _read_parquet_as_text(file_path)
+            else:
+                with open(file_path, 'r', encoding='utf-8') as file:
+                    text = file.read()
             print(f"Chess games file loaded: {file_path}")
             print(f"Total characters: {len(text)}")
 
@@ -1258,7 +1471,7 @@ def save_token_embeddings(model, filepath):
     print(f"Token embedding saved: {filename} in {model_folder}")
 
 
-def save_model_all(model, all_text, n_embd, n_head, n_kv_heads, n_layer, dropout, block_size, epoch, batch_idx, batch_size, optimizer, scheduler, scaler, loss, learning_rate=None, weight_decay=None, gpu_indices=None):
+def save_model_all(model, all_text, n_embd, n_head, n_kv_heads, n_layer, dropout, block_size, epoch, batch_idx, batch_size, optimizer, scheduler, scaler, loss, learning_rate=None, weight_decay=None, gpu_indices=None, token_mode='4token'):
     """
     Save complete chess model checkpoint with all training state.
 
@@ -1345,8 +1558,9 @@ def save_model_all(model, all_text, n_embd, n_head, n_kv_heads, n_layer, dropout
         'epoch': epoch,
         'batch_idx': batch_idx,
         'hyperparameters': {
-            'vocab_size': ROLE_VOCAB_SIZE,
-            'format_version': 2,
+            'vocab_size': len(move_to_idx),
+            'format_version': 3 if token_mode == 'classic' else 2,
+            'token_mode': token_mode,
             'n_embd': n_embd,
             'n_head': n_head,
             'n_kv_heads': n_kv_heads,
@@ -1385,22 +1599,7 @@ def test_progress(epoch, num_epochs, batch_idx, data_loader, loss, model, x, tok
     """
     Generate sample chess moves during training to monitor model progress.
 
-    Uses 4-token-per-ply generation: COLOR, FROM, TO (conditioned on FROM), PROMO.
-
-    Args:
-        epoch: Current training epoch
-        num_epochs: Total training epochs
-        batch_idx: Current batch index within epoch
-        data_loader: Training data loader (for progress display)
-        loss: Current training loss value
-        model: ChessModel (may be wrapped in DataParallel)
-        x: Current batch input tensor [batch_size, seq_len]
-        tokens_to_generate: Number of plies to generate
-        all_text: Accumulator string for generated samples across training
-        idx_to_move: Dictionary mapping token indices back to token names
-
-    Returns:
-        Updated all_text string with new generated samples appended
+    Supports both classic (1-token) and 4-token-per-ply generation modes.
     """
     print(f"\nEpoch [{epoch+1}/{num_epochs}], Batch [{batch_idx+1}/{len(data_loader)}], Loss: {loss:.4f}")
 
@@ -1408,13 +1607,16 @@ def test_progress(epoch, num_epochs, batch_idx, data_loader, loss, model, x, tok
     model.eval()
     model_single = model.module if isinstance(model, nn.DataParallel) else model
 
-    # Print per-head losses for diagnostics
-    model_raw_diag = model_single._orig_mod if hasattr(model_single, '_orig_mod') else model_single
-    if hasattr(model_raw_diag, '_last_head_losses'):
-        hl = model_raw_diag._last_head_losses
-        print(f"  Head losses -> color: {hl['color']:.4f}  from: {hl['from']:.4f}  to: {hl['to']:.4f}  promo: {hl['promo']:.4f}")
-    # Handle torch.compile wrapper for direct attribute access
+    # Detect token mode
     model_raw = model_single._orig_mod if hasattr(model_single, '_orig_mod') else model_single
+    token_mode = getattr(model_raw, 'token_mode', '4token')
+
+    # Print per-head losses for 4token mode diagnostics
+    if token_mode == '4token':
+        model_raw_diag = model_raw
+        if hasattr(model_raw_diag, '_last_head_losses'):
+            hl = model_raw_diag._last_head_losses
+            print(f"  Head losses -> color: {hl['color']:.4f}  from: {hl['from']:.4f}  to: {hl['to']:.4f}  promo: {hl['promo']:.4f}")
 
     with torch.no_grad():
         input_seq = x[-1].unsqueeze(0)
@@ -1424,79 +1626,99 @@ def test_progress(epoch, num_epochs, batch_idx, data_loader, loss, model, x, tok
         print("\nInput Sequence:")
         print(input_seq_str)
 
-        generated_moves = []
-        num_plies = min(tokens_to_generate, 32)  # Each ply = 4 forward passes
         dev = input_seq.device
 
-        # Trim input to last complete ply boundary (PROMO or SPECIAL token)
-        # so generation always starts at the correct point in the 4-token cycle.
-        # Without this, if input ends mid-ply (e.g. at FROM), the color head
-        # gets a hidden state it was never trained on, producing garbage.
-        tokens_list = input_seq[0].tolist()
-        trim_to = len(tokens_list)
-        for j in range(len(tokens_list) - 1, -1, -1):
-            t = tokens_list[j]
-            if (PROMO_OFFSET <= t < PROMO_OFFSET + 5) or t in (STARTGAME, EOFG, W_RESULT, D_RESULT, PAD):
-                trim_to = j + 1
-                break
-        if trim_to < len(tokens_list):
-            input_seq = input_seq[:, :trim_to]
-            # Re-pad to block_size
-            pad_len = x.shape[-1] - trim_to
-            if pad_len > 0:
-                padding = torch.full((1, pad_len), PAD, dtype=torch.long, device=dev)
-                input_seq = torch.cat([padding, input_seq], dim=1)
+        if token_mode == 'classic':
+            # === CLASSIC MODE: simple autoregressive generation ===
+            generated_moves = []
+            num_moves = min(tokens_to_generate, 32)
+            # Find special token IDs to skip during generation
+            special_ids = set()
+            for name in ['<STARTGAME>', '<EOFG>', '<PAD>', '<W>', '<D>']:
+                if name in move_to_idx:
+                    special_ids.add(move_to_idx[name])
 
-        for _ in range(num_plies):
-            # 1. COLOR prediction (model should learn W/B alternation)
-            output, _ = model_single(input_seq)
-            color_logits = output['color'][0, -1]  # [2]
-            color_idx = color_logits.argmax(dim=-1).item()
-            color_tok = COLOR_OFFSET + color_idx
-            input_seq = torch.cat([input_seq[:, 1:],
-                                   torch.tensor([[color_tok]], device=dev)], dim=1)
+            for _ in range(num_moves):
+                logits, _ = model_single(input_seq)
+                next_logits = logits[0, -1]  # [vocab_size]
+                # Mask out special tokens
+                for sid in special_ids:
+                    next_logits[sid] = float('-inf')
+                next_tok = next_logits.argmax(dim=-1).item()
+                move_name = idx_to_move.get(next_tok, f'<UNK:{next_tok}>')
+                generated_moves.append(move_name)
+                input_seq = torch.cat([input_seq[:, 1:],
+                                       torch.tensor([[next_tok]], device=dev)], dim=1)
 
-            # 2. FROM prediction
-            output, _ = model_single(input_seq)
-            from_logits = output['from'][0, -1]  # [64]
-            from_sq = from_logits.argmax(dim=-1).item()
-            from_tok = FROM_OFFSET + from_sq
-            input_seq = torch.cat([input_seq[:, 1:],
-                                   torch.tensor([[from_tok]], device=dev)], dim=1)
+            generated_text = ' '.join(generated_moves)
 
-            # 3. TO prediction (conditioned on FROM)
-            output, _ = model_single(input_seq)
-            h_last = output['hidden'][0, -1]  # [n_embd]
-            from_emb = model_raw.emb_from(
-                torch.tensor(from_sq, device=dev)
-            )
-            h_conditioned = h_last + from_emb
-            to_logits = model_raw.head_to(h_conditioned)  # [64]
-            # Ensure TO != FROM
-            to_logits[from_sq] = float('-inf')
-            to_sq = to_logits.argmax(dim=-1).item()
-            to_tok = TO_OFFSET + to_sq
-            input_seq = torch.cat([input_seq[:, 1:],
-                                   torch.tensor([[to_tok]], device=dev)], dim=1)
+        else:
+            # === 4-TOKEN MODE: 4-step role-specific generation (unchanged) ===
+            generated_moves = []
+            num_plies = min(tokens_to_generate, 32)
 
-            # 4. PROMO prediction
-            output, _ = model_single(input_seq)
-            promo_logits = output['promo'][0, -1]  # [5]
-            promo_idx = promo_logits.argmax(dim=-1).item()
-            promo_tok = PROMO_OFFSET + promo_idx
-            input_seq = torch.cat([input_seq[:, 1:],
-                                   torch.tensor([[promo_tok]], device=dev)], dim=1)
+            # Trim input to last complete ply boundary
+            tokens_list = input_seq[0].tolist()
+            trim_to = len(tokens_list)
+            for j in range(len(tokens_list) - 1, -1, -1):
+                t = tokens_list[j]
+                if (PROMO_OFFSET <= t < PROMO_OFFSET + 5) or t in (STARTGAME, EOFG, W_RESULT, D_RESULT, PAD):
+                    trim_to = j + 1
+                    break
+            if trim_to < len(tokens_list):
+                input_seq = input_seq[:, :trim_to]
+                pad_len = x.shape[-1] - trim_to
+                if pad_len > 0:
+                    padding = torch.full((1, pad_len), PAD, dtype=torch.long, device=dev)
+                    input_seq = torch.cat([padding, input_seq], dim=1)
 
-            # Reconstruct UCI move string
-            from_str = square_to_uci(from_sq)
-            to_str = square_to_uci(to_sq)
-            promo_chars = ['', 'q', 'r', 'b', 'n']
-            promo_str = promo_chars[promo_idx] if promo_idx < len(promo_chars) else ''
-            color_str = 'W' if color_idx == 0 else 'B'
-            move_str = f"{color_str}:{from_str}{to_str}{promo_str}"
-            generated_moves.append(move_str)
+            for _ in range(num_plies):
+                # 1. COLOR prediction
+                output, _ = model_single(input_seq)
+                color_logits = output['color'][0, -1]
+                color_idx = color_logits.argmax(dim=-1).item()
+                color_tok = COLOR_OFFSET + color_idx
+                input_seq = torch.cat([input_seq[:, 1:],
+                                       torch.tensor([[color_tok]], device=dev)], dim=1)
 
-        generated_text = ' '.join(generated_moves)
+                # 2. FROM prediction
+                output, _ = model_single(input_seq)
+                from_logits = output['from'][0, -1]
+                from_sq = from_logits.argmax(dim=-1).item()
+                from_tok = FROM_OFFSET + from_sq
+                input_seq = torch.cat([input_seq[:, 1:],
+                                       torch.tensor([[from_tok]], device=dev)], dim=1)
+
+                # 3. TO prediction (conditioned on FROM)
+                output, _ = model_single(input_seq)
+                h_last = output['hidden'][0, -1]
+                from_emb = model_raw.emb_from(torch.tensor(from_sq, device=dev))
+                h_conditioned = h_last + from_emb
+                to_logits = model_raw.head_to(h_conditioned)
+                to_logits[from_sq] = float('-inf')
+                to_sq = to_logits.argmax(dim=-1).item()
+                to_tok = TO_OFFSET + to_sq
+                input_seq = torch.cat([input_seq[:, 1:],
+                                       torch.tensor([[to_tok]], device=dev)], dim=1)
+
+                # 4. PROMO prediction
+                output, _ = model_single(input_seq)
+                promo_logits = output['promo'][0, -1]
+                promo_idx = promo_logits.argmax(dim=-1).item()
+                promo_tok = PROMO_OFFSET + promo_idx
+                input_seq = torch.cat([input_seq[:, 1:],
+                                       torch.tensor([[promo_tok]], device=dev)], dim=1)
+
+                # Reconstruct UCI move string
+                from_str = square_to_uci(from_sq)
+                to_str = square_to_uci(to_sq)
+                promo_chars = ['', 'q', 'r', 'b', 'n']
+                promo_str = promo_chars[promo_idx] if promo_idx < len(promo_chars) else ''
+                color_str = 'W' if color_idx == 0 else 'B'
+                move_str = f"{color_str}:{from_str}{to_str}{promo_str}"
+                generated_moves.append(move_str)
+
+            generated_text = ' '.join(generated_moves)
 
         print("\nGenerated Moves:")
         print(generated_text)
@@ -1553,9 +1775,12 @@ def load_model_file(model_file_path=None):
         # Get hyperparameters
         hyperparameters = checkpoint['hyperparameters']
 
-        # Check format version - reject old composite-move checkpoints
+        # Detect token mode from checkpoint
+        token_mode = hyperparameters.get('token_mode', '4token')
         fmt_version = hyperparameters.get('format_version', 1)
-        if fmt_version < 2:
+
+        # Reject truly ancient checkpoints (format_version 1 without token_mode)
+        if fmt_version < 2 and token_mode == '4token':
             print("ERROR: Old checkpoint format (composite move tokens) not compatible with role-specific heads.")
             print("       This checkpoint uses the ~20K composite vocabulary. Re-train with the new 4-token-per-ply format.")
             return None
@@ -1570,24 +1795,33 @@ def load_model_file(model_file_path=None):
         # Ensure n_embd is divisible by n_head for attention layers
         if n_embd % n_head != 0:
             print(f"Warning: n_embd ({n_embd}) not divisible by n_head ({n_head}), adjusting n_embd")
-            # Find smallest n_embd >= current that is divisible by n_head
             original_embd = n_embd
             while n_embd % n_head != 0:
-                n_embd += n_head  # Increase by n_head to maintain head_dim
+                n_embd += n_head
             print(f"Adjusted n_embd from {original_embd} to {n_embd} (head_dim = {n_embd // n_head})")
 
         n_kv_heads = hyperparameters.get('n_kv_heads', n_head // 4)
 
-        # Load tokenizer
+        # Load tokenizer — set globals based on mode
+        global move_to_idx, idx_to_move
         tokenizer = checkpoint.get('tokenizer')
         if isinstance(tokenizer, dict):
-            global move_to_idx, idx_to_move
             move_to_idx = tokenizer
             idx_to_move = {idx: move for move, idx in move_to_idx.items()}
-            print(f"Loaded chess moves tokenizer with {len(move_to_idx)} tokens")
+            print(f"Loaded {token_mode} tokenizer with {len(move_to_idx)} tokens")
+        elif token_mode == 'classic':
+            move_to_idx = create_classic_move_to_idx()
+            idx_to_move = create_classic_idx_to_move(move_to_idx)
+            vocab_size = len(move_to_idx)
+            print(f"Created fresh classic tokenizer with {len(move_to_idx)} tokens")
+        else:
+            move_to_idx = create_move_to_idx()
+            idx_to_move = create_idx_to_move()
 
-        # Create chess model
-        model = ChessModel(vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout)
+        # Create chess model with correct mode
+        print(f"Creating ChessModel in '{token_mode}' mode (vocab_size={vocab_size})")
+        model = ChessModel(vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout,
+                           use_chess=True, token_mode=token_mode)
         model.start_game_token = move_to_idx['<STARTGAME>']
 
         # Move model to device before loading state dict
@@ -1677,7 +1911,7 @@ def enter_batch_size(n_embd, n_head, block_size, n_layer, batch_size, gpu_indice
         n_kv_heads = max(1, n_head // 4)
 
     # --- Model static memory (per GPU replica) ---
-    vocab_size = ROLE_VOCAB_SIZE
+    vocab_size = len(move_to_idx)
     token_emb = vocab_size * n_embd
     pos_emb = block_size * n_embd
     attn_per_layer = n_embd * n_embd + n_embd * n_kv_heads * head_dim * 2 + n_embd * n_embd  # Q+KV+Out
@@ -1757,7 +1991,7 @@ idx_to_move = create_idx_to_move()
 
 
 # Core training function
-def _train_chess_model_core(text, checkpoint_data=None):
+def _train_chess_model_core(text, checkpoint_data=None, token_mode='4token'):
     """
     Core training logic for chess move prediction model.
 
@@ -1777,10 +2011,11 @@ def _train_chess_model_core(text, checkpoint_data=None):
         text: Preprocessed chess game text data
         checkpoint_data: Optional tuple from load_model_file() for training resumption
                         Contains: (model, vocab_size, n_embd, n_head, n_kv_heads, block_size,
+        token_mode: 'classic' or '4token'
     """
     print("ChessBrain - Chess Move Prediction LLM")
     print("=" * 50)
-    print(f"DEBUG: Starting _train_chess_model_core with text length: {len(text)}")
+    print(f"DEBUG: Starting _train_chess_model_core with text length: {len(text)}, mode: {token_mode}")
 
     vocab_size = len(move_to_idx)
     print(f"Vocabulary size: {vocab_size}")
@@ -1902,7 +2137,7 @@ def _train_chess_model_core(text, checkpoint_data=None):
         n_embd = CHESS_DEFAULTS['n_embd']
         n_head = CHESS_DEFAULTS['n_head']
         n_kv_heads = CHESS_DEFAULTS['n_kv_heads']
-        block_size = CHESS_DEFAULTS['block_size']
+        block_size = 128 if token_mode == 'classic' else CHESS_DEFAULTS['block_size']  # Classic: 128 half-moves=64 full; 4-token: 512/4=64 full
         n_layer = CHESS_DEFAULTS['n_layer']
         dropout = CHESS_DEFAULTS['dropout']
         batch_size = CHESS_DEFAULTS['batch_size']
@@ -1927,7 +2162,9 @@ def _train_chess_model_core(text, checkpoint_data=None):
             print(f"Adjusted n_embd from {original_embd} to {n_embd} (head_dim = {n_embd // n_head})")
 
         # Create your own TransformerModel for chess move prediction
-        model = ChessModel(vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout, use_chess=True)
+        print(f"Creating ChessModel in '{token_mode}' mode (vocab_size={vocab_size})")
+        model = ChessModel(vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout,
+                           use_chess=True, token_mode=token_mode)
         model.start_game_token = move_to_idx['<STARTGAME>']
 
         num_params = sum(p.numel() for p in model.parameters())
@@ -2028,7 +2265,7 @@ def _train_chess_model_core(text, checkpoint_data=None):
 
                         for i, gpu_idx in enumerate(gpu_indices):
                             # Create model on specific GPU
-                            model_gpu = ChessModel(vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout, use_chess=True)
+                            model_gpu = ChessModel(vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout, use_chess=True, token_mode=token_mode)
                             model_gpu.start_game_token = move_to_idx['<STARTGAME>']
                             
                             # If loading from checkpoint, copy the loaded weights to each GPU model
@@ -2273,9 +2510,12 @@ def _train_chess_model_core(text, checkpoint_data=None):
                 print("⚠️  Scaler state incompatible (continuing with fresh scaler)")
                 print("   This is normal after PyTorch updates or configuration changes")
 
-    # Create dataset and dataloader
-    dataset = ChessMovesDataset(text, block_size, move_to_idx)
-    print(f"Dataset size: {len(dataset)} sequences")
+    # Create dataset and dataloader (select class based on token mode)
+    if token_mode == 'classic':
+        dataset = ClassicChessMovesDataset(text, block_size, move_to_idx)
+    else:
+        dataset = ChessMovesDataset(text, block_size, move_to_idx)
+    print(f"Dataset size: {len(dataset)} sequences ({token_mode} mode)")
 
     # Check GPU capability for Blackwell-specific fixes (cache this - don't call every batch)
     gpu_capability = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (8, 6)
@@ -2501,7 +2741,7 @@ def _train_chess_model_core(text, checkpoint_data=None):
                     save_model_all(
                         models[0], all_text, n_embd, n_head, n_kv_heads, n_layer, dropout,
                         block_size, epoch, batch_idx, batch_size, optimizers[0], schedulers[0], scalers[0], avg_loss,
-                        learning_rate, weight_decay, gpu_indices
+                        learning_rate, weight_decay, gpu_indices, token_mode
                     )
 
                     running_loss = 0.0
@@ -2516,7 +2756,7 @@ def _train_chess_model_core(text, checkpoint_data=None):
                 if _interrupt_requested[0]:
                     _interrupt_requested[0] = False
                     current_lr = optimizers[0].param_groups[0]['lr']
-                    result = _handle_training_interrupt(dataset, block_size, move_to_idx, current_lr)
+                    result = _handle_training_interrupt(dataset, block_size, move_to_idx, current_lr, token_mode)
                     if result is None:
                         _batch_interrupted = True
                         _quit_training = True
@@ -2760,7 +3000,7 @@ def _train_chess_model_core(text, checkpoint_data=None):
                         save_model_all(
                             model, all_text, n_embd, n_head, n_kv_heads, n_layer, dropout,
                             block_size, epoch, batch_idx, batch_size, optimizer, scheduler, scaler, current_loss_value,
-                            learning_rate, weight_decay, gpu_indices
+                            learning_rate, weight_decay, gpu_indices, token_mode
                         )
 
                         # Clean up inference tensors (Blackwell-specific)
@@ -2774,7 +3014,7 @@ def _train_chess_model_core(text, checkpoint_data=None):
                     if _interrupt_requested[0]:
                         _interrupt_requested[0] = False
                         current_lr = optimizer.param_groups[0]['lr']
-                        result = _handle_training_interrupt(dataset, block_size, move_to_idx, current_lr)
+                        result = _handle_training_interrupt(dataset, block_size, move_to_idx, current_lr, token_mode)
                         if result is None:
                             _batch_interrupted = True
                             _quit_training = True
@@ -2844,7 +3084,7 @@ def _train_chess_model_core(text, checkpoint_data=None):
 
 
 # Main training function
-def _handle_training_interrupt(dataset, block_size, move_to_idx, current_lr=None):
+def _handle_training_interrupt(dataset, block_size, move_to_idx, current_lr=None, token_mode='4token'):
     """Handle Ctrl+C during training. Returns dict with 'dataset' and 'lr' keys, or None to quit."""
     print("\n\n" + "=" * 50)
     print("Training interrupted! (Ctrl+C)")
@@ -2875,21 +3115,28 @@ def _handle_training_interrupt(dataset, block_size, move_to_idx, current_lr=None
     if choice == 'y':
         print("\nSelect new training data file...")
         file_path = create_file_dialog(
-            title="Select New Chess Games File", filetypes=[("Text files", "*.txt")])
+            title="Select New Chess Games File",
+            filetypes=[("Chess files", "*.txt *.parquet"), ("Text files", "*.txt"), ("Parquet files", "*.parquet")])
         if not file_path:
             print("No file selected.")
         else:
             print(f"Loading chess file: {file_path}")
-            with open(file_path, 'r', encoding='utf-8') as f:
-                text = f.read()
+            if file_path.lower().endswith('.parquet'):
+                text = _read_parquet_as_text(file_path)
+            else:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
             games = text.split('\n\n')
             games = ['<STARTGAME>' + ' ' + game.strip() + ' ' + '<EOFG>'
                      for game in games if game.strip()]
             text = '\n'.join(games)
             print(f"New dataset loaded. Games: {len(games)}, Characters: {len(text)}")
 
-            result['dataset'] = ChessMovesDataset(text, block_size, move_to_idx)
-            print(f"New dataset: {len(result['dataset'])} sequences")
+            if token_mode == 'classic':
+                result['dataset'] = ClassicChessMovesDataset(text, block_size, move_to_idx)
+            else:
+                result['dataset'] = ChessMovesDataset(text, block_size, move_to_idx)
+            print(f"New dataset: {len(result['dataset'])} sequences ({token_mode} mode)")
 
     # If nothing changed, still return result (not None) so training continues
     if result['dataset'] is None and result['lr'] is None:
@@ -2901,15 +3148,18 @@ def _handle_training_interrupt(dataset, block_size, move_to_idx, current_lr=None
 
 def train_chess_model():
     """Main training entry point. Ctrl+C during training lets you pick a new data file."""
-    text, checkpoint_data = load_data_interactive()
-    _train_chess_model_core(text, checkpoint_data)
+    text, checkpoint_data, token_mode = load_data_interactive()
+    _train_chess_model_core(text, checkpoint_data, token_mode)
 
 
 def load_data_interactive():
-    """Load data in single process mode (interactive)"""
-    global gpu_indices
+    """Load data in single process mode (interactive).
+    Returns (text, checkpoint_data, token_mode).
+    """
+    global gpu_indices, move_to_idx, idx_to_move
     text = ""
     checkpoint_data = None
+    token_mode = 'classic'  # Default for new models
 
     # Ask user to choose between loading model or creating new
     load_or_create = get_input_with_default("Load a model file or Create a new model? (l/c)", "c").lower()
@@ -2918,11 +3168,35 @@ def load_data_interactive():
         loaded_data = load_model_file()
         if loaded_data:
             checkpoint_data = loaded_data
+            # Read mode from checkpoint hyperparameters
+            checkpoint_hyperparams = loaded_data[-1]  # last element is hyperparameters
+            token_mode = checkpoint_hyperparams.get('token_mode', '4token')
+            print(f"Checkpoint token mode: {token_mode}")
         else:
             print("Failed to load model. Creating a new one.")
             checkpoint_data = None
     else:
         checkpoint_data = None
+
+    # For new models, prompt for token mode
+    if checkpoint_data is None:
+        print("\nToken Mode Selection:")
+        print("  classic  - 1 token per move (~20K vocab, 512 moves of context)")
+        print("  4token   - 4 tokens per ply (140 vocab, role-specific heads)")
+        token_mode = get_input_with_default("Token mode (classic/4token)", "classic").lower()
+        if token_mode not in ('classic', '4token'):
+            print(f"Unknown mode '{token_mode}', defaulting to 'classic'")
+            token_mode = 'classic'
+
+        # Set globals based on chosen mode
+        if token_mode == 'classic':
+            move_to_idx = create_classic_move_to_idx()
+            idx_to_move = create_classic_idx_to_move(move_to_idx)
+            print(f"Classic tokenizer created: {len(move_to_idx)} tokens")
+        else:
+            move_to_idx = create_move_to_idx()
+            idx_to_move = create_idx_to_move()
+            print(f"4-token tokenizer created: {len(move_to_idx)} tokens")
 
     # GPU selection - only for fresh training (checkpoint loading will set its own GPUs)
     if checkpoint_data is None and torch.cuda.is_available():
@@ -2935,14 +3209,14 @@ def load_data_interactive():
         custom_gpus = input(f"Enter GPU indices separated by commas (default: all {num_gpus} GPUs): ")
 
         if not custom_gpus.strip():
-            gpu_indices = all_gpus  # Default to all available GPUs
+            gpu_indices = all_gpus
             print(f"Using all {num_gpus} GPU{'s' if num_gpus > 1 else ''}: {gpu_indices}")
         else:
             try:
                 gpu_indices = [int(idx.strip()) for idx in custom_gpus.split(',')]
                 print(f"Selected GPUs: {gpu_indices}")
             except ValueError:
-                gpu_indices = all_gpus  # Fallback to all GPUs
+                gpu_indices = all_gpus
                 print(f"Invalid input. Using all {num_gpus} GPU{'s' if num_gpus > 1 else ''}: {gpu_indices}")
 
         # Set CUDA_VISIBLE_DEVICES for fresh training
@@ -2951,20 +3225,25 @@ def load_data_interactive():
             print(f"CUDA_VISIBLE_DEVICES set to: {os.environ['CUDA_VISIBLE_DEVICES']}")
 
     # Always use interactive file selection
-    file_path = create_file_dialog(title="Select Chess Games File for Training", filetypes=[("Text files", "*.txt")])
+    file_path = create_file_dialog(
+        title="Select Chess Games File for Training",
+        filetypes=[("Chess files", "*.txt *.parquet"), ("Text files", "*.txt"), ("Parquet files", "*.parquet")])
     if not file_path:
         print("No chess file selected. Exiting.")
         exit()
 
     print(f"Loading chess file: {file_path}")
-    with open(file_path, 'r', encoding='utf-8') as file:
-        text = file.read()
+    if file_path.lower().endswith('.parquet'):
+        text = _read_parquet_as_text(file_path)
+    else:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            text = file.read()
     games = text.split('\n\n')
     games = ['<STARTGAME>' + ' ' + game.strip() + ' ' + '<EOFG>' for game in games if game.strip()]
     text = '\n'.join(games)
     print(f"Chess dataset loaded. Total games: {len(games)}, Total characters: {len(text)}")
 
-    return text, checkpoint_data
+    return text, checkpoint_data, token_mode
 
 
 if __name__ == "__main__":

@@ -769,7 +769,6 @@ def simulate_move(board, move, real_board=False):
 # - Quiescence search at leaf nodes for tactical stability
 #
 
-# ======================================================================================
 def select_best_ai_move_improved(board, depth, color, AI_color, alpha=float('-inf'), beta=float('inf'), display_simulation=False, last_move=None, initial_depth=None):
     global transposition_table, piece_values, depth_formula, discount
 
@@ -1118,391 +1117,24 @@ def parse_llm_response(response, board, color):
 def initialize_ai_model(color):
     global llm_white, llm_black, block_size, ai_method_white, ai_method_black
 
-    print(f"AI model initialized successfully for {color}.")
     if color == 'W':
         print("Initializing white model...")
         llm_white = brain_inference.initialize_model()
         if llm_white is None:
-            print(f"Failed to initialize AI model for {color}. Exiting.")
+            print(f"Failed to initialize AI model for {color}.")
             return False
-        block_size = brain_inference.global_model.block_size # only allow one block size
-        ai_method_white = "LLM"  # Automatically switch to LLM when model loads
+        block_size = brain_inference.global_model.block_size
+        ai_method_white = "LLM"
     else:
         print("Initializing black model...")
         llm_black = brain_inference.initialize_model()
         if llm_black is None:
-            print(f"Failed to initialize AI model for {color}. Exiting.")
+            print(f"Failed to initialize AI model for {color}.")
             return False
         block_size = brain_inference.global_model.block_size
-        ai_method_black = "LLM"  # Automatically switch to LLM when model loads
-
-    return True
-def select_best_ai_move_improved(board, depth, color, AI_color, alpha=float('-inf'), beta=float('inf'), display_simulation=False, last_move=None, initial_depth=None):
-    global transposition_table, piece_values, depth_formula, discount
-
-    # Use optimizations
-    use_transposition = True
-    use_killer_moves = True
-
-    # Transposition table lookup
-    board_key = (tuple(map(tuple, board)), color, AI_color)  # Include whose turn it is and which AI is playing
-    if use_transposition and board_key in transposition_table:
-        eval_board, eval_depth, best_move_new = transposition_table[board_key]
-        if display_simulation:
-           print(f"Transposition Table hit for {color} {depth} {eval_board:.2f} {eval_depth} {best_move_new} {last_move}")
-        if eval_depth >= depth:
-            return eval_board, best_move_new
-
-    legal_moves = get_all_legal_moves(board, color, last_move=last_move, check_legality=True)
-    
-    # DEBUG: Check if legal_moves is unexpectedly empty at top level
-    if depth == initial_depth:
-        print(f"DEBUG ENTRY: color={color}, depth={depth}, initial={initial_depth}, legal_moves={len(legal_moves)}")
-    
-    check = is_in_check(board, color)
-
-    evaluation = evaluate_board(board)
-
-    if not check and not legal_moves:
-        evaluation = evaluation * (discount**((initial_depth + 1) - depth))
-        if display_simulation:
-            print(f"Stalemate, no legal moves for {color}. Evaluation: {-evaluation:.2f}")
-            print(f"Depth: {depth}, Last move: {last_move}")
-        return -evaluation, []
-
-    if check and not legal_moves:
-        if color == "W":
-            evaluation = (evaluation - 100) * (discount**((initial_depth + 1) - depth))
-        else:
-            evaluation = (evaluation + 100) * (discount**((initial_depth + 1) - depth))
-        if display_simulation:
-            print(f"Checkmate of {color}. Evaluation: {evaluation:.2f}")
-            print(f"Depth: {depth}, Last move: {last_move} of {'W' if color == 'B' else 'B'}")
-        return evaluation, []
-
-    if depth <= 0:
-        return quiescence_search(board, color, AI_color, alpha, beta, 0, 2)
-
-    # ======================================================================================
-    # NULL MOVE PRUNING OPTIMIZATION
-    # ======================================================================================
-    #
-    # Allows opponent to "pass" their turn to test position strength.
-    #
-    # HOW IT WORKS:
-    # 1. Temporarily give opponent an extra move (null move)
-    # 2. If opponent still can't create a threat, position must be very strong
-    # 3. Reduces search tree by pruning weak positions early
-    # 4. Only used when not in check (passing when in check is illegal)
-    # 5. Uses reduced depth (depth-3) for efficiency
-    #
-    # EXAMPLE: If current position is so good that opponent gains nothing from extra move,
-    # then we can prune this branch and avoid deeper search.
-    #
-    # ======================================================================================
-    # Null Move Pruning (not at root level - must return actual move at root)
-    if depth > 2 and not check and depth < initial_depth:
-        null_move_eval, _ = select_best_ai_move_improved(board, depth - 3, 'B' if color == 'W' else 'W', AI_color, -beta, -beta + 1, display_simulation, last_move, initial_depth)
-        null_move_eval = -null_move_eval
-        if null_move_eval >= beta:
-            return beta, []
-
-    # ======================================================================================
-    # MOVE ORDERING HEURISTIC - CRITICAL FOR ALPHA-BETA EFFICIENCY
-    # ======================================================================================
-    #
-    # Orders moves to improve alpha-beta pruning effectiveness.
-    # Better ordered moves = more pruning = faster search.
-    #
-    # ORDERING CRITERIA (highest priority first):
-    # 1. Killer Moves: Moves that caused beta cutoffs at same depth in other branches
-    # 2. Captures: MVV-LVA (Most Valuable Victim - Least Valuable Attacker)
-    #    - Queen takes Pawn (high priority - saves queen)
-    #    - Pawn takes Queen (high priority - gains queen)
-    # 3. Center control and advancement bonuses
-    # 4. Pawn promotions (very high priority)
-    #
-    # Killer moves work because: if a move caused cutoff elsewhere, likely good here too
-    #
-    # ======================================================================================
-    # Move Ordering with killer moves heuristic
-    def order_moves(board, moves, color):
-        global killer_moves
-        ordered_moves = []
-        for move in moves:
-            score = 0
-            piece = board[move[0][0]][move[0][1]]
-            target = board[move[1][0]][move[1][1]]
-
-            # Check if this is a killer move (beta cutoff move from previous iterations)
-            if use_killer_moves:
-                for depth_idx in range(min(depth, len(killer_moves))):
-                    if killer_moves[depth_idx][0] == move or killer_moves[depth_idx][1] == move:
-                        score += 1000  # High priority for killer moves
-
-            if target:
-                score += 10 * abs(piece_values.get(target, 0)) - abs(piece_values.get(piece, 0))
-
-            score += (3 - abs(3.5 - move[1][1])) + (3 - abs(3.5 - move[1][0]))
-
-            if piece[1] == 'P' and (move[1][0] == 0 or move[1][0] == 7):
-                score += 900
-
-            ordered_moves.append((move, score))
-
-        return sorted(ordered_moves, key=lambda x: x[1], reverse=(color == 'W'))
-
-    scored_moves = order_moves(board, legal_moves, color)
-
-    length = len(scored_moves)
-    if length > eval(depth_formula):
-        scored_moves = scored_moves[:eval(depth_formula)]
-
-    # DEBUG: Check if moves are being eliminated
-    if display_simulation or len(scored_moves) == 0:
-        print(f"DEBUG: depth={depth}, color={color}, legal_moves={len(legal_moves)}, scored_moves={len(scored_moves)}, formula={depth_formula}, eval={eval(depth_formula) if length > 0 else 'N/A'}")
-
-    best_eval = float('-inf') if color == AI_color else float('inf')
-    best_move_new = []
-
-    for move_index, (move, _) in enumerate(scored_moves):
-        new_board = simulate_move(board, move, real_board=False)
-
-        # ======================================================================================
-        # LATE MOVE REDUCTION OPTIMIZATION
-        # ======================================================================================
-        #
-        # Assumes later moves in ordered list are less likely to be best moves.
-        #
-        # HOW IT WORKS:
-        # 1. For moves after first 3-4 in ordered list, search at reduced depth (depth-2)
-        # 2. If reduced-depth search doesn't improve alpha, skip full-depth search
-        # 3. Based on principle: best moves are usually found early in ordering
-        # 4. Only applied when not in check and not capturing (tactical moves need full depth)
-        #
-        # SIGNIFICANT SPEEDUP: Reduces branching factor for unpromising moves
-        #
-        # ======================================================================================
-        # Late Move Reduction
-        if depth >= 3 and move_index > 3 and not check and not board[move[1][0]][move[1][1]]:
-            eval_board, opponent_best_move = select_best_ai_move_improved(new_board, depth-2, 'B' if color == 'W' else 'W', AI_color, alpha, beta, display_simulation, move, initial_depth)
-            if (color == AI_color and eval_board < alpha) or (color != AI_color and eval_board > beta):
-                continue
-
-        eval_board, opponent_best_move = select_best_ai_move_improved(new_board, depth-1, 'B' if color == 'W' else 'W', AI_color, alpha, beta, display_simulation, move, initial_depth)
-
-        # Update bounds immediately with current move evaluation
-        if color == AI_color:
-            alpha = max(alpha, eval_board)
-        else:
-            beta = min(beta, eval_board)
-
-        # Update best move if this evaluation is better
-        if (color == AI_color and eval_board > best_eval) or (color != AI_color and eval_board < best_eval):
-            best_eval = eval_board
-            best_move_new = [move] + opponent_best_move if opponent_best_move else [move]
-
-        if beta <= alpha:
-            # Store killer move for better move ordering in future searches
-            if use_killer_moves and depth < len(killer_moves):
-                if killer_moves[depth][0] != move:
-                    killer_moves[depth][1] = killer_moves[depth][0]  # Shift previous killer move
-                    killer_moves[depth][0] = move  # Store new killer move
-            break
-
-    if use_transposition:
-        transposition_table[board_key] = best_eval, depth, best_move_new
-    
-    # DEBUG: Print what we're returning if it's empty at top level
-    if depth == initial_depth and len(best_move_new) == 0:
-        print(f"WARNING at return: empty move! depth={depth}, color={color}, AI_color={AI_color}, legal={len(legal_moves)}, scored was={length}")
-    
-    return best_eval, best_move_new
-
-# ======================================================================================
-# QUIESCENCE SEARCH ALGORITHM
-# ======================================================================================
-#
-# Solves the "horizon effect" where tactical threats are missed just beyond search depth.
-#
-# HOW IT WORKS:
-# 1. At leaf nodes of main search, continues searching captures only
-# 2. Ensures tactical stability - won't evaluate position where captures are still possible
-# 3. Stops when no captures available or max depth reached
-# 4. Uses "stand pat" evaluation - current position value if no capture is forced
-# 5. Alpha-beta pruning applied to captures for efficiency
-#
-# MVV-LVA ORDERING:
-# Sorts captures by Most Valuable Victim minus Least Valuable Attacker
-# Prioritizes queen captures, then rook captures, etc.
-# Example: Pawn takes Queen = high priority, Queen takes Pawn = lower priority
-#
-# ======================================================================================
-def quiescence_search(board, color, AI_color, alpha, beta, depth, max_depth):
-    stand_pat = evaluate_board(board)
-    if depth >= max_depth:
-        return stand_pat, []
-
-    if color == 'W':
-        if stand_pat >= beta:
-            return beta, []
-        if stand_pat > alpha:
-            alpha = stand_pat
-    else:
-        if stand_pat <= alpha:
-            return alpha, []
-        if stand_pat < beta:
-            beta = stand_pat
-
-    captures = [move for move in get_all_legal_moves(board, color, check_legality=True) if board[move[1][0]][move[1][1]] != '']
-    best_move = []
-
-    # Sort captures by most valuable victim and least valuable attacker (MVV-LVA)
-    def capture_value(move):
-        attacker = board[move[0][0]][move[0][1]]
-        victim = board[move[1][0]][move[1][1]]
-        return piece_values.get(victim, 0) * 10 - piece_values.get(attacker, 0)
-
-    captures.sort(key=capture_value, reverse=True)
-
-    for move in captures:
-        new_board = simulate_move(board, move, real_board=False)
-        score, _ = quiescence_search(new_board, 'B' if color == 'W' else 'W', AI_color, -beta, -alpha, depth + 1, max_depth)
-        score = -score
-        if color == 'W':
-            if score > alpha:
-                alpha = score
-                best_move = [move]
-            if alpha >= beta:
-                return beta, best_move
-        else:
-            if score < beta:
-                beta = score
-                best_move = [move]
-            if beta <= alpha:
-                return alpha, best_move
-
-    return (alpha if color == 'W' else beta, best_move)
-
-
-
-
-
-
-
-
-def convert_to_standard_notation_simple(move):
-    """Convert a move from the game's format to simple standard chess notation (just coordinates)."""
-    start, end = move
-    start_square = chr(97 + start[1]) + str(8 - start[0])
-    end_square = chr(97 + end[1]) + str(8 - end[0])
-    return f"{start_square}{end_square}"
-
-def parse_llm_response(response, board, color):
-    """Parse the LLM response and convert all moves to the game's format."""
-    moves = response.strip().split()
-    if not moves:
-        print("No moves found in response")
-        return []
-
-    parsed_moves = []
-    for first_move in moves:
-        first_move = first_move.lower()  # Convert to lowercase for consistent processing
-        #print(f"Parsing move: {first_move}")
-
-        # Handle castling
-        if first_move in ['o-o', 'o-o-o', '0-0', '0-0-0']:
-            row = 7 if color == 'W' else 0
-            if first_move in ['o-o', '0-0']:  # Kingside castling
-                move = ((row, 4), (row, 6))
-            else:  # Queenside castling
-                move = ((row, 4), (row, 2))
-            print(f"Castling move: {move}")
-            parsed_moves.append(move)
-            continue
-
-        # Handle pawn promotion
-        promotion = None
-        if '=' in first_move:
-            first_move, promotion = first_move.split('=')
-            promotion = promotion.upper()
-
-        # Remove '+' or '#' if present (check or checkmate symbols)
-        first_move = first_move.rstrip('+#')
-
-        # Handle UCI notation (e.g., "e2e4", "e7e8q", "E2E4", "E7E8Q")
-        if len(first_move) in [4, 5] and first_move[:4].isalnum():
-            start_col, start_row = ord(first_move[0].lower()) - 97, 8 - int(first_move[1])
-            end_col, end_row = ord(first_move[2].lower()) - 97, 8 - int(first_move[3])
-
-            # Handle promotion (5th character in UCI notation)
-            move_promotion = None
-            if len(first_move) == 5:
-                promo_char = first_move[4].lower()
-                # Map UCI promotion chars to piece letters
-                promo_map = {'q': 'Q', 'r': 'R', 'b': 'B', 'n': 'N'}
-                if promo_char in promo_map:
-                    move_promotion = promo_map[promo_char]
-                else:
-                    print(f"Warning: Invalid promotion character '{promo_char}' in move '{first_move}', ignoring promotion")
-
-            move = ((start_row, start_col), (end_row, end_col))
-            #print(f"UCI move: {move}, promotion: {move_promotion}")
-
-            # Use move_promotion if present, otherwise fall back to the '=' parsed promotion
-            final_promotion = move_promotion or promotion
-            parsed_moves.append(move if not final_promotion else move + (final_promotion,))
-            continue
-
-        # Handle standard algebraic notation (e.g., "e4", "Nf3", "E4", "NF3")
-        if len(first_move) in [2, 3, 4]:
-            piece = 'P' if len(first_move) == 2 or first_move[0].islower() else first_move[0].upper()
-            end_col = ord(first_move[-2].lower()) - 97
-            if first_move[-1].isdigit():
-                end_row = 8 - int(first_move[-1])
-            else:
-                print(f"Invalid move format: {first_move}")
-                continue
-            
-            # Find the piece that can make this move
-            for start_row in range(8):
-                for start_col in range(8):
-                    if board[start_row][start_col].upper() == color + piece:
-                        move = ((start_row, start_col), (end_row, end_col))
-                        print(f"Standard algebraic move: {move}")
-                        parsed_moves.append(move if not promotion else move + (promotion,))
-                        break
-                else:
-                    continue
-                break
-            else:
-                print(f"Failed to parse move: {first_move}")
-
-    #print(f"All parsed moves: {parsed_moves}")
-    return parsed_moves
-
-
-def initialize_ai_model(color):
-    global llm_white, llm_black, block_size, ai_method_white, ai_method_black
+        ai_method_black = "LLM"
 
     print(f"AI model initialized successfully for {color}.")
-    if color == 'W':
-        print("Initializing white model...")
-        llm_white = brain_inference.initialize_model()
-        if llm_white is None:
-            print(f"Failed to initialize AI model for {color}. Exiting.")
-            return False
-        block_size = brain_inference.global_model.block_size # only allow one block size
-        ai_method_white = "LLM"  # Automatically switch to LLM when model loads
-    else:
-        print("Initializing black model...")
-        llm_black = brain_inference.initialize_model()
-        if llm_black is None:
-            print(f"Failed to initialize AI model for {color}. Exiting.")
-            return False
-        block_size = brain_inference.global_model.block_size
-        ai_method_black = "LLM"  # Automatically switch to LLM when model loads
-
     return True
 def select_best_ai_move_llm(board, depth, color, AI_color, alpha=float('-inf'), beta=float('inf'), display_simulation=False, last_move=None, initial_depth=None):
     """AI method that uses the LLM for move selection."""
@@ -1519,40 +1151,28 @@ def select_best_ai_move_llm(board, depth, color, AI_color, alpha=float('-inf'), 
         return None, []
 
     # Prepare the input for the LLM
-    if len(game_history_simple) == 1:
-        moves_string = game_history_simple[0]  # This will be "<startgame>"
-    elif len(game_history_simple) == 2:
-        moves_string = "".join(game_history_simple)  # "<startgame> FirstMove"
-    else:
-        moves_string = " ".join(game_history_simple)
+    moves_string = " ".join(game_history_simple)
 
-    # Truncate the moves_string to fit within the model's block size
-    # CHANGES: Remove whole moves and special tokens in chunks
-    while len(moves_string) > block_size:
-        if moves_string.startswith("<STARTGAME>"):
-            moves_string = moves_string[11:]  # Remove "<STARTGAME>"
-        else:
-            space_index = moves_string.find(' ')
-            if space_index != -1:
-                moves_string = moves_string[space_index + 1:]
-            else:
-                moves_string = moves_string[-block_size:]
-    
-    prompt = f"Chess game in progress. Move history: {moves_string} Move: {color}"
-    print("Prompt: ", prompt)
+    # Truncate to fit within the model's block size (in moves, not tokens)
+    # Classic: 1 token/move, 4-token: 4 tokens/move
+    token_mode = getattr(model, '_token_mode', None)
+    if token_mode is None:
+        model_raw = model._orig_mod if hasattr(model, '_orig_mod') else model
+        token_mode = getattr(model_raw, 'token_mode', '4token')
+    tokens_per_move = 1 if token_mode == 'classic' else 4
+    max_moves = block_size // tokens_per_move
+    parts = moves_string.split()
+    if len(parts) > max_moves:
+        parts = parts[-max_moves:]
+    moves_string = " ".join(parts)
+    print(f"Input: {len(parts)} moves, block_size={block_size}, mode={token_mode}")
 
     # Get the LLM's response
     token_to_idx = brain_inference.global_tokenizer
-    #char_to_idx = brain_inference.global_char_to_idx
     idx_to_token = brain_inference.global_tokenizer_reverse
 
-    use_characters = brain_inference.global_use_characters
-    use_chess_moves = brain_inference.global_use_chess_moves
-    response_length = 10
-
-    #def generate_response(model, tokenizer, tokenizer_reverse, input_text, tokens_to_generate=10, use_characters=False, use_chess_moves=True, top_k=k):
     try:
-        llm_responses = generate_response(model, token_to_idx, idx_to_token, moves_string, tokens_to_generate=response_length, use_characters=use_characters, use_chess_moves=use_chess_moves, top_k=k)
+        llm_responses = generate_response(model, token_to_idx, idx_to_token, moves_string, top_k=k)
         print("LLM responses: ", llm_responses)
     except IndexError:
         print("Error: LLM failed to generate responses. Falling back to random move.")

@@ -669,18 +669,22 @@ def load_model_file(frommain=False):
             
             # Determine model architecture based on checkpoint contents
             fmt_version = hyperparameters.get('format_version', 1)
+            token_mode = hyperparameters.get('token_mode', '4token')
             has_role_heads = any('head_color' in key for key in state_dict.keys())
+            has_lm_head = any('lm_head' in key for key in state_dict.keys())
             has_factorized_heads = any('from_head' in key for key in state_dict.keys())
             has_mobile_llm_features = any('rms_1' in key or 'swiglu' in key for key in state_dict.keys())
 
-            if has_role_heads or fmt_version >= 2:
-                # New 4-token-per-ply format with role-specific heads
-                print("Loading ChessModel (role-specific heads, format v2)...")
-                n_kv_heads = hyperparameters.get('n_kv_heads', n_head // 4)
+            # Import ChessModel from brain module (used by both classic and 4-token)
+            import sys, os
+            sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+            from Chess_Brain_WB_2_12_26 import ChessModel, create_classic_move_to_idx, create_classic_idx_to_move
 
-                import sys
-                sys.path.append('/home/jonathan/Chess')
-                from Chess_Brain_WB_2_12_26 import ChessModel
+            # Classic mode: format_version 3, or has lm_head + rms blocks
+            if token_mode == 'classic' or (fmt_version >= 3 and has_lm_head):
+                token_mode = 'classic'
+                print(f"Loading ChessModel (classic 1-token mode, vocab={vocab_size})...")
+                n_kv_heads = hyperparameters.get('n_kv_heads', n_head // 4)
 
                 model = ChessModel(
                     vocab_size=vocab_size,
@@ -690,7 +694,34 @@ def load_model_file(frommain=False):
                     block_size=block_size,
                     n_layer=n_layer,
                     dropout=dropout,
-                    use_chess=True
+                    use_chess=True,
+                    token_mode='classic'
+                )
+
+                # Use checkpoint tokenizer if available, otherwise create fresh
+                tokenizer = checkpoint.get('tokenizer')
+                if not isinstance(tokenizer, dict):
+                    tokenizer = create_classic_move_to_idx()
+                # Update global move_to_idx for tokenization
+                global move_to_idx
+                move_to_idx = tokenizer
+
+            elif has_role_heads or fmt_version >= 2:
+                # New 4-token-per-ply format with role-specific heads
+                token_mode = '4token'
+                print("Loading ChessModel (role-specific heads, format v2)...")
+                n_kv_heads = hyperparameters.get('n_kv_heads', n_head // 4)
+
+                model = ChessModel(
+                    vocab_size=vocab_size,
+                    n_embd=n_embd,
+                    n_head=n_head,
+                    n_kv_heads=n_kv_heads,
+                    block_size=block_size,
+                    n_layer=n_layer,
+                    dropout=dropout,
+                    use_chess=True,
+                    token_mode='4token'
                 )
 
                 # Use the 140-token tokenizer
@@ -726,8 +757,7 @@ def load_model_file(frommain=False):
                     n_head=n_head,
                     block_size=block_size,
                     n_layer=n_layer,
-                    dropout=dropout,
-                    use_chess=True
+                    dropout=dropout
                 )
                 tokenizer = checkpoint.get('tokenizer')
 
@@ -756,7 +786,14 @@ def load_model_file(frommain=False):
                 print(f"Error loading state dict: {e}")
                 print("Attempting to load with strict=False...")
                 model.load_state_dict(state_dict, strict=False)
-            
+
+            # Store token mode for generation routing
+            model._token_mode = token_mode
+            # Fix start_game_token for classic mode (ChessModel.__init__ uses Brain's global)
+            if token_mode == 'classic' and hasattr(model, 'start_game_token') and isinstance(tokenizer, dict):
+                model.start_game_token = tokenizer.get('<STARTGAME>', model.start_game_token)
+            print(f"Model token mode: {token_mode}")
+
             return model, vocab_size, n_embd, n_head, block_size, n_layer, dropout, tokenizer
             
     except Exception as e:
@@ -764,10 +801,97 @@ def load_model_file(frommain=False):
         return None, None, None, None, None, None, None, None
 
 
+def _generate_classic(model, tokenizer, tokenizer_reverse, input_text, top_k=10):
+    """
+    Generate top-k candidate NEXT moves using classic 1-token-per-move model.
+
+    Tokenizes the game history into single tokens, runs one forward pass,
+    and returns the top-k move tokens (excluding special tokens).
+
+    Returns:
+        List of top-k UCI move strings (e.g. ['E2E4', 'G1F3', ...])
+    """
+    model.eval()
+    model.to(device)
+
+    if tokenizer is None:
+        print("Error: Tokenizer not available")
+        return []
+
+    # Build reverse map for special token IDs
+    special_names = {'<STARTGAME>', '<EOFG>', '<PAD>', '<W>', '<D>'}
+    special_ids = {tokenizer[n] for n in special_names if n in tokenizer}
+
+    # Tokenize game history
+    tokens = []
+    i = 0
+    while i < len(input_text):
+        if input_text[i:i+11] == '<STARTGAME>':
+            tokens.append(tokenizer['<STARTGAME>']); i += 11
+        elif input_text[i:i+6] == '<EOFG>':
+            tokens.append(tokenizer['<EOFG>']); i += 6
+        elif input_text[i:i+3] == '<W>':
+            tokens.append(tokenizer['<W>']); i += 3
+        elif input_text[i:i+3] == '<D>':
+            tokens.append(tokenizer['<D>']); i += 3
+        elif input_text[i].isspace():
+            i += 1
+        elif i + 4 <= len(input_text):
+            move_str = None
+            if i + 5 <= len(input_text) and input_text[i+4].isalpha() and input_text[i+4].lower() in 'qrbn':
+                c = input_text[i:i+5].upper()
+                if c[0].isalpha() and c[1].isdigit() and c[2].isalpha() and c[3].isdigit():
+                    if c in tokenizer:
+                        move_str = c; i += 5
+            if move_str is None:
+                c = input_text[i:i+4].upper()
+                if c[0].isalpha() and c[1].isdigit() and c[2].isalpha() and c[3].isdigit():
+                    if c in tokenizer:
+                        move_str = c; i += 4
+                    else:
+                        i += 1; continue
+                else:
+                    i += 1; continue
+            tokens.append(tokenizer[move_str])
+        else:
+            i += 1
+
+    # Truncate to block_size
+    block_size = model.block_size if hasattr(model, 'block_size') else 512
+    if len(tokens) > block_size:
+        tokens = tokens[-block_size:]
+
+    input_seq = torch.tensor([tokens], dtype=torch.long).to(device)
+
+    with torch.no_grad():
+        logits, _ = model(input_seq)
+        next_logits = logits[0, -1]  # [vocab_size]
+
+        # Mask out special tokens
+        for sid in special_ids:
+            next_logits[sid] = float('-inf')
+
+        # Get top-k
+        probs = F.softmax(next_logits, dim=-1)
+        top_probs, top_ids = torch.topk(probs, k=min(top_k, len(probs)))
+
+        result_moves = []
+        for tid in top_ids:
+            move_name = tokenizer_reverse.get(tid.item(), '')
+            if move_name and move_name not in special_names:
+                # Classic tokens are like "E2E4" or "E7E8Q" — lowercase for UCI
+                result_moves.append(move_name.lower())
+
+    print(f"Classic top {len(result_moves)} candidate moves: {result_moves}")
+    return result_moves
+
+
 def generate_response(model, tokenizer, tokenizer_reverse, input_text,
                      tokens_to_generate=5, top_k=10, use_characters=False, use_chess_moves=True, use_dna=False):
     """
-    Generate top-k candidate NEXT moves using 4-token-per-ply role-specific heads.
+    Generate top-k candidate NEXT moves.
+
+    Routes to classic or 4-token generation based on model._token_mode.
 
     Returns a list of up to top_k UCI move strings (e.g. ['e2e4', 'g1f3', ...])
     ranked by model confidence. The chess game checks legality and picks the first legal one.
@@ -784,6 +908,16 @@ def generate_response(model, tokenizer, tokenizer_reverse, input_text,
     Returns:
         List of top-k UCI move strings (e.g. ['e2e4', 'g1f3', 'd2d4', ...])
     """
+    # Route to classic generation if model is in classic mode
+    token_mode = getattr(model, '_token_mode', None)
+    if token_mode is None:
+        # Check inside torch.compile wrapper
+        model_raw = model._orig_mod if hasattr(model, '_orig_mod') else model
+        token_mode = getattr(model_raw, 'token_mode', '4token')
+    if token_mode == 'classic':
+        return _generate_classic(model, tokenizer, tokenizer_reverse, input_text, top_k)
+
+    # === 4-TOKEN MODE: existing generation logic ===
     model.eval()
     model.to(device)
 
