@@ -28,7 +28,6 @@ def parse_checkpoint_filename(filename):
     Parse checkpoint filename to extract epoch, batch, and loss.
     Filename format: C12H12E768_B64_E1B57300_L2.874_1010_2245.pth
     """
-    # Match pattern: E{epoch}B{batch}_L{loss}_{timestamp}.pth
     pattern = r'E(\d+)B(\d+)_L([\d.]+)_'
     match = re.search(pattern, filename)
 
@@ -42,7 +41,8 @@ def parse_checkpoint_filename(filename):
 def scan_checkpoints(folder_path):
     """
     Scan checkpoint folder and extract loss data from filenames.
-    Returns list of (epoch, batch, loss) tuples sorted by epoch and batch.
+    Order: oldest file modification time first, then newest (os.path.getmtime).
+    Each row: (epoch, batch, loss, mtime, filename).
     """
     checkpoints = []
 
@@ -54,10 +54,13 @@ def scan_checkpoints(folder_path):
         if filename.endswith('.pth'):
             data = parse_checkpoint_filename(filename)
             if data:
-                checkpoints.append(data)
+                epoch, batch, loss = data
+                full_path = os.path.join(folder_path, filename)
+                mtime = os.path.getmtime(full_path)
+                checkpoints.append((epoch, batch, loss, mtime, filename))
 
-    # Sort by epoch, then by batch
-    checkpoints.sort(key=lambda x: (x[0], x[1]))
+    # Oldest modified → newest
+    checkpoints.sort(key=lambda x: (x[3], x[4]))
 
     return checkpoints
 
@@ -71,15 +74,22 @@ def get_plot_data_filename(folder_path):
 def load_saved_plot_data(folder_path):
     """
     Load previously saved plot data from the folder.
-    Returns a list of (epoch, batch, loss) tuples, or empty list if no saved data.
+    Returns list of (epoch, batch, loss, mtime, filename). Legacy rows may lack mtime (0.0).
     """
     data_file = get_plot_data_filename(folder_path)
     if os.path.exists(data_file):
         try:
             with open(data_file, 'r') as f:
                 data = json.load(f)
-                # Convert back to list of tuples
-                return [(item['epoch'], item['batch'], item['loss']) for item in data]
+                out = []
+                for item in data:
+                    epoch = item['epoch']
+                    batch = item['batch']
+                    loss = item['loss']
+                    mtime = float(item.get('mtime', 0.0))
+                    fn = item.get('filename', '')
+                    out.append((epoch, batch, loss, mtime, fn))
+                return out
         except (json.JSONDecodeError, KeyError):
             print(f"Warning: Could not load saved plot data from {data_file}")
             return []
@@ -92,9 +102,17 @@ def save_plot_data(folder_path, checkpoints):
     """
     data_file = get_plot_data_filename(folder_path)
 
-    # Convert to list of dictionaries for JSON serialization
-    data = [{'epoch': epoch, 'batch': batch, 'loss': loss}
-            for epoch, batch, loss in checkpoints]
+    # mtime + filename so order survives after files are deleted
+    data = []
+    for epoch, batch, loss, mtime, filename in checkpoints:
+        row = {
+            'epoch': epoch,
+            'batch': batch,
+            'loss': loss,
+            'mtime': mtime,
+            'filename': filename,
+        }
+        data.append(row)
 
     try:
         with open(data_file, 'w') as f:
@@ -103,40 +121,35 @@ def save_plot_data(folder_path, checkpoints):
     except Exception as e:
         print(f"Warning: Could not save plot data to {data_file}: {e}")
 
+def _merge_key(cp):
+    """Unique id: filename if present, else (epoch, batch) for legacy rows."""
+    epoch, batch, loss, mtime, filename = cp
+    if filename:
+        return ('file', filename)
+    return ('eb', epoch, batch)
+
+
 def merge_checkpoint_data(current_checkpoints, saved_checkpoints):
     """
     Merge current checkpoint data with saved historical data.
-    This ensures we have complete data even if some checkpoint files were deleted.
-    Saved data is used as fallback for any missing checkpoints.
+    Current files win on duplicate filename; final order is by mtime (oldest first).
     """
     if not saved_checkpoints:
         return current_checkpoints
 
-    # Create a dictionary of current checkpoints keyed by (epoch, batch)
-    current_dict = {(epoch, batch): loss for epoch, batch, loss in current_checkpoints}
-
-    # Start with all saved data as base
     merged = list(saved_checkpoints)
+    index_by_key = {_merge_key(cp): i for i, cp in enumerate(merged)}
 
-    # Update/add any current checkpoints (these take priority over saved data)
-    for epoch, batch, loss in current_checkpoints:
-        key = (epoch, batch)
-        # Check if this checkpoint already exists in merged data
-        existing_index = None
-        for i, (e, b, l) in enumerate(merged):
-            if (e, b) == key:
-                existing_index = i
-                break
-
+    for cp in current_checkpoints:
+        key = _merge_key(cp)
+        existing_index = index_by_key.get(key)
         if existing_index is not None:
-            # Update existing entry
-            merged[existing_index] = (epoch, batch, loss)
+            merged[existing_index] = cp
         else:
-            # Add new entry
-            merged.append((epoch, batch, loss))
+            index_by_key[key] = len(merged)
+            merged.append(cp)
 
-    # Sort by epoch, then by batch
-    merged.sort(key=lambda x: (x[0], x[1]))
+    merged.sort(key=lambda x: (x[3], x[4]))
 
     return merged
 
@@ -194,7 +207,7 @@ def plot_loss_progression(checkpoints, folder_name):
         x_values.append(cumulative_batch / 1000.0)  # Scale for readability
         cumulative_batch += 1
 
-    # Create the plot'/home/jonathan/Data' 
+    # Create the plot
     
     plt.figure(figsize=(12, 6))
 
@@ -280,7 +293,7 @@ def main():
     if checkpoints:
         print(f"Found {len(checkpoints)} checkpoints")
         print("Sample data points:")
-        for i, (epoch, batch, loss) in enumerate(checkpoints[:5]):
+        for i, (epoch, batch, loss, _mtime, _fn) in enumerate(checkpoints[:5]):
             print(f"  Epoch {epoch}, Batch {batch}: Loss {loss:.4f}")
         if len(checkpoints) > 5:
             print(f"  ... and {len(checkpoints) - 5} more")
@@ -288,7 +301,7 @@ def main():
         # Display the lowest 5 scores
         print("\nLowest 5 scores:")
         lowest_scores = sorted(checkpoints, key=lambda x: x[2])[:5]
-        for i, (epoch, batch, loss) in enumerate(lowest_scores, 1):
+        for i, (epoch, batch, loss, _m, _fn) in enumerate(lowest_scores, 1):
             print(f"  {i}. Epoch {epoch}, Batch {batch}: Loss {loss:.4f}")
 
         try:
