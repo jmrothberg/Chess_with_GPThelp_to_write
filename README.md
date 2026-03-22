@@ -7,7 +7,7 @@ A transformer that learns to play chess by reading raw move sequences. No chess 
 The model reads chess games as sequences of UCI moves and learns to predict the next move. Training data is loaded directly from **parquet files** containing Stockfish self-play games — no preprocessing required.
 
 ```
-<STARTGAME> e2e4 e7e5 g1f3 b8c6 f1b5 ... <W>
+<STARTGAME> <W> e2e4 e7e5 g1f3 b8c6 f1b5 ... <EOFG>
 ```
 
 Two tokenization modes are available, selected at training startup:
@@ -56,7 +56,7 @@ See [README_CHESS_PER_GAME.md](README_CHESS_PER_GAME.md) for detailed documentat
 | `Chess_Brain_WB_2_12_26.py` | Model training (multi-GPU, both modes) |
 | `Chess_Inference_WB_2_12_26.py` | Model inference (auto-detects mode from checkpoint) |
 | `Chess_WB_2_12_26.py` | Interactive chess game (Pygame GUI) |
-| `plot_loss_Nov_9_25.py` | Training loss visualization |
+| `plot_loss_March_20_26.py` | Training loss visualization |
 | `combine_chess_datasets.py` | Combine game files for training |
 
 ## Training

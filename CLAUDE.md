@@ -19,7 +19,7 @@ python Chess_Brain_WB_2_12_26.py
 python Chess_WB_2_12_26.py
 
 # Plot training loss from checkpoint filenames
-python plot_loss_Nov_9_25.py [checkpoint_folder]
+python plot_loss_March_20_26.py [checkpoint_folder]
 
 # Combine .txt game files into larger training sets
 python combine_chess_datasets.py <group_size> <input_dir> <output_dir>
