@@ -340,6 +340,10 @@ class MultiQueryAttention(nn.Module):
         self.kv_proj = nn.Linear(n_embd, n_kv_heads * head_dim * 2)  # Combine k and v projections
         self.out_proj = nn.Linear(n_embd, n_embd)
 
+        # QK-Norm: stabilizes attention logits, prevents explosion
+        self.q_norm = RMSNorm(head_dim)
+        self.k_norm = RMSNorm(head_dim)
+
         self.dropout = nn.Dropout(dropout)
         self.register_buffer('causal_mask', torch.tril(torch.ones(1024, 1024)))
         self.flash_available = hasattr(F, 'scaled_dot_product_attention')
@@ -356,6 +360,10 @@ class MultiQueryAttention(nn.Module):
         kv = self.kv_proj(x).view(B, T, self.n_kv_heads, 2, self.head_dim)  # (B, T, n_kv_heads, 2, head_dim)
         kv = kv.transpose(1, 2)  # (B, n_kv_heads, T, 2, head_dim)
         k, v = kv[..., 0, :], kv[..., 1, :]  # Split into k and v
+
+        # QK-Norm: normalize Q and K before attention to prevent logit explosion
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         # Repeat keys and values to match the number of query heads
         k = k.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)

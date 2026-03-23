@@ -326,25 +326,12 @@ class MultiHeadAttention(nn.Module):
 
             # Use flash attention with the correctly shaped mask
             if self.flash_available:
-                # Check if our PyTorch version supports the advanced args
-                try:
-                    # Try with all optimizations
-                    y = F.scaled_dot_product_attention(
-                        q, k, v,
-                        attn_mask=attention_mask,  # Shape: [B, 1, T, T]
-                        dropout_p=self.dropout.p if self.training else 0.0,
-                        is_causal=False,  # We're handling causality in our mask
-                        scale=1.0 / math.sqrt(k.size(-1)),  # Explicit scaling for precision
-                        mem_efficient=True  # Use memory efficient attention
-                    )
-                except TypeError:
-                    # Fallback to standard arguments
-                    y = F.scaled_dot_product_attention(
-                        q, k, v,
-                        attn_mask=attention_mask,  # Shape: [B, 1, T, T]
-                        dropout_p=self.dropout.p if self.training else 0.0,
-                        is_causal=False  # We're handling causality in our mask
-                    )
+                y = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=attention_mask,
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    is_causal=False
+                )
         else:
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
@@ -443,6 +430,10 @@ class MultiQueryAttention(nn.Module):
         self.kv_proj = nn.Linear(n_embd, n_kv_heads * head_dim * 2)
         self.out_proj = nn.Linear(n_embd, n_embd)
 
+        # QK-Norm: stabilizes attention logits, prevents explosion (Gemma 3 style)
+        self.q_norm = RMSNorm(head_dim)
+        self.k_norm = RMSNorm(head_dim)
+
         self.dropout = nn.Dropout(dropout)
         self.register_buffer('causal_mask', torch.tril(torch.ones(1024, 1024)))
         self.flash_available = hasattr(F, 'scaled_dot_product_attention')
@@ -459,6 +450,10 @@ class MultiQueryAttention(nn.Module):
         kv = self.kv_proj(x).view(B, T, self.n_kv_heads, 2, self.head_dim)
         kv = kv.transpose(1, 2)
         k, v = kv[..., 0, :], kv[..., 1, :]
+
+        # QK-Norm: normalize Q and K before attention to prevent logit explosion
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         # Repeat keys and values to match the number of query heads
         k = k.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
@@ -478,23 +473,13 @@ class MultiQueryAttention(nn.Module):
 
             attention_mask = combined_mask.unsqueeze(1)
 
-            # Use flash attention
-            try:
-                y = F.scaled_dot_product_attention(
-                    q, k, v,
-                    attn_mask=attention_mask,
-                    dropout_p=self.dropout.p if self.training else 0.0,
-                    is_causal=False,
-                    scale=1.0 / math.sqrt(k.size(-1)),
-                    mem_efficient=True
-                )
-            except TypeError:
-                y = F.scaled_dot_product_attention(
-                    q, k, v,
-                    attn_mask=attention_mask,
-                    dropout_p=self.dropout.p if self.training else 0.0,
-                    is_causal=False
-                )
+            # Use flash attention (SDPA auto-selects optimal backend)
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attention_mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=False
+            )
         else:
             # Fallback attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -765,6 +750,13 @@ class ChessModel(nn.Module):
 
         # Initialize weights
         self.apply(self._init_weights)
+
+        # Scale residual output projections by 1/sqrt(2*n_layer) to prevent
+        # variance growth across deep residual streams (GPT-2 convention)
+        residual_scale = 1.0 / math.sqrt(2 * n_layer)
+        for block in self.blocks:
+            torch.nn.init.normal_(block.attn.out_proj.weight, mean=0.0, std=0.02 * residual_scale)
+            torch.nn.init.normal_(block.swiglu.w3.weight, mean=0.0, std=0.02 * residual_scale)
 
         # Mild smoothing reduces overconfidence on deterministic Stockfish lines
         self.label_smoothing = 0.05
@@ -2301,7 +2293,7 @@ def _train_chess_model_core(text, checkpoint_data=None, token_mode='4token'):
                                             print(f"   Load an older, clean checkpoint instead.")
                                             exit(1)
 
-                                model_gpu.load_state_dict(cleaned_state)
+                                model_gpu.load_state_dict(cleaned_state, strict=False)
                             
                             model_gpu = model_gpu.to(f'cuda:{i}')  # Use remapped indices
                             models.append(model_gpu)
@@ -2909,18 +2901,13 @@ def _train_chess_model_core(text, checkpoint_data=None, token_mode='4token'):
                         print(f"Batch shapes: x={x.shape}, y={y.shape}, y_roles={y_roles.shape}")
                         print(f"Data device: x={x.device}, y={y.device}")
 
-                    # Forward pass with optimized mixed precision for chess model training
+                    # Forward pass with BF16 mixed precision (no GradScaler needed)
                     if device.type == 'cuda':
-                        with autocast(device_type='cuda', dtype=torch.float16, enabled=True):
+                        with autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
                             output, loss = model(x, targets=y, target_roles=y_roles)
 
-                        # Backward pass with gradient scaling for mixed precision stability
                         optimizer.zero_grad(set_to_none=True)
-
-                        scaler.scale(loss).backward()  # Scale loss for FP16 gradient stability
-
-                        # Unscale gradients before clipping (required for Adafactor with mixed precision)
-                        scaler.unscale_(optimizer)
+                        loss.backward()
 
                         # Apply gradient clipping to prevent chess model training instability
                         model_params = get_model_module(model).parameters()
@@ -2928,9 +2915,7 @@ def _train_chess_model_core(text, checkpoint_data=None, token_mode='4token'):
                         if total_norm > clip_threshold:
                             print(f"Chess model gradient clipping applied at batch {batch_idx} in epoch {epoch}. Total norm: {total_norm:.2f}. Loss: {loss:.4f}")
 
-                        # Update optimizer and scaler
-                        scaler.step(optimizer)
-                        scaler.update()
+                        optimizer.step()
                     else:
                         output, loss = model(x, targets=y, target_roles=y_roles)
                         optimizer.zero_grad(set_to_none=True)
