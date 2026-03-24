@@ -455,9 +455,10 @@ class MultiQueryAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        # Repeat keys and values to match the number of query heads
-        k = k.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
-        v = v.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
+        # Expand KV heads to match query heads (view, no memory copy)
+        repeat = self.n_heads // self.n_kv_heads
+        k = k.unsqueeze(2).expand(B, self.n_kv_heads, repeat, T, self.head_dim).reshape(B, self.n_heads, T, self.head_dim)
+        v = v.unsqueeze(2).expand(B, self.n_kv_heads, repeat, T, self.head_dim).reshape(B, self.n_heads, T, self.head_dim)
 
         if self.flash_available:
             # Prepare masks
@@ -2305,7 +2306,8 @@ def _train_chess_model_core(text, checkpoint_data=None, token_mode='4token'):
                                     lr=learning_rate,
                                     weight_decay=weight_decay,
                                     betas=(0.9, 0.999),
-                                    eps=1e-8
+                                    eps=1e-8,
+                                    fused=True
                                 )
                             else:
                                 opt = Adafactor(
@@ -2487,7 +2489,8 @@ def _train_chess_model_core(text, checkpoint_data=None, token_mode='4token'):
                 lr=learning_rate,
                 weight_decay=weight_decay,
                 betas=(0.9, 0.999),
-                eps=1e-8
+                eps=1e-8,
+                fused=torch.cuda.is_available()
             )
         else:
             print("🔧 Using Adafactor optimizer (memory efficient for large models)")
