@@ -26,12 +26,12 @@ Version History:
 - Nov 22, 2024: Support for both basic and optimized chess models
 """
 
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 import os
-import glob
 
 # Device configuration for inference
 # For performance: CUDA > MPS > CPU
@@ -550,6 +550,94 @@ class MobileLLMModel(nn.Module):
 
 
 
+# ChessBlock is identical to Block at inference time (gradient checkpointing is training-only)
+ChessBlock = Block
+
+
+class ChessModel(nn.Module):
+    """
+    Chess move prediction transformer (inference-only copy, no Chess_Brain dependency).
+    Supports both classic (single lm_head) and 4-token (role-specific heads) modes.
+    """
+    def __init__(self, vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout, use_chess=False, use_dna=False, token_mode='4token'):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.block_size = block_size
+        self.use_chess = use_chess
+        self.token_mode = token_mode
+        self.start_game_token = None
+
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.register_buffer('pos_indices', torch.arange(block_size))
+
+        self.blocks = nn.ModuleList([
+            ChessBlock(n_embd=n_embd, n_head=n_head, n_kv_heads=n_kv_heads, dropout=dropout)
+            for _ in range(n_layer)
+        ])
+        self.rms_final = RMSNorm(n_embd)
+
+        if token_mode == 'classic':
+            self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+            self.lm_head.weight = self.token_embedding_table.weight
+        else:
+            self.head_color = nn.Linear(n_embd, 2)
+            self.head_from = nn.Linear(n_embd, 64)
+            self.head_to = nn.Linear(n_embd, 64)
+            self.head_promo = nn.Linear(n_embd, 5)
+            self.emb_from = nn.Embedding(64, n_embd)
+
+    def create_game_mask(self, idx):
+        if not self.use_chess or self.start_game_token is None:
+            return None
+        game_boundaries = (idx == self.start_game_token).float().cumsum(dim=1)
+        return (game_boundaries.unsqueeze(1) == game_boundaries.unsqueeze(2)).float()
+
+    def forward(self, idx, targets=None, target_roles=None):
+        B, T = idx.shape
+        tok_emb = self.token_embedding_table(idx)
+        pos_emb = self.position_embedding_table(self.pos_indices[:T])
+        x = tok_emb + pos_emb
+
+        game_mask = self.create_game_mask(idx)
+        for block in self.blocks:
+            x = block(x, mask=game_mask)
+
+        x = self.rms_final(x)
+
+        if self.token_mode == 'classic':
+            logits = self.lm_head(x)
+            return logits, None
+        else:
+            return x, None
+
+
+def create_classic_move_to_idx():
+    """Create classic ~20K vocab: 64*63*5 move tokens + 5 special."""
+    m = {}
+    for from_sq in range(64):
+        from_file = chr(97 + (from_sq % 8))
+        from_rank = str(8 - (from_sq // 8))
+        for to_sq in range(64):
+            if to_sq == from_sq:
+                continue
+            to_file = chr(97 + (to_sq % 8))
+            to_rank = str(8 - (to_sq // 8))
+            to_offset = to_sq if to_sq < from_sq else (to_sq - 1)
+            for promo_idx, promo_char in enumerate(['', 'q', 'r', 'b', 'n']):
+                move_id = (from_sq * 63 * 5) + (to_offset * 5) + promo_idx
+                move_str = f"{from_file}{from_rank}{to_file}{to_rank}{promo_char}".upper()
+                m[move_str] = move_id
+    for idx, token in enumerate(['<STARTGAME>', '<EOFG>', '<PAD>', '<W>', '<D>'], start=len(m)):
+        m[token] = idx
+    return m
+
+
+def create_classic_idx_to_move(classic_move_to_idx):
+    """Reverse mapping for classic tokenizer."""
+    return {idx: move for move, idx in classic_move_to_idx.items()}
+
+
 # === Role-specific 4-token-per-ply constants (must match Chess_Brain_WB_2_12_26.py) ===
 ROLE_COLOR = 0; ROLE_FROM = 1; ROLE_TO = 2; ROLE_PROMO = 3; ROLE_SPECIAL = -1
 COLOR_OFFSET = 0; FROM_OFFSET = 2; TO_OFFSET = 66; PROMO_OFFSET = 130
@@ -592,8 +680,7 @@ def create_move_to_idx():
 move_to_idx = create_move_to_idx()
 
 
-
-def load_model_file(frommain=False):
+def load_model_file(checkpoint_path=None):
     """
     Load and initialize a trained chess transformer model from checkpoint.
 
@@ -612,55 +699,20 @@ def load_model_file(frommain=False):
     - MobileLLMModel: Memory-efficient with RMSNorm, MultiQueryAttention, SwiGLU
 
     Args:
-        frommain: Internal flag for main script execution
+        checkpoint_path: Path to a .pth checkpoint (required; no GUI dialog in this module).
 
     Returns:
         Tuple: (model, vocab_size, n_embd, n_head, block_size, n_layer, dropout, tokenizer)
-
-    Raises:
-        File selection dialog if model_file_path not provided and not frommain
     """
-    running_on_mac = os.name == 'posix' and os.uname().sysname == 'Darwin'
     try:
-        if not frommain and running_on_mac:
-            chess_directory = "."
-            if not os.path.exists(chess_directory):
-                print(f"Directory not found: {chess_directory}")
-                return None, None, None, None, None, None, None, None
+        if not checkpoint_path or not os.path.isfile(checkpoint_path):
+            if checkpoint_path:
+                print(f"Checkpoint not found: {checkpoint_path}")
+            else:
+                print("load_model_file: checkpoint_path is required.")
+            return None, None, None, None, None, None, None, None
 
-            pth_files = glob.glob(os.path.join(chess_directory, "*.pth"))
-            if not pth_files:
-                print(f"No .pth files found in {chess_directory}")
-                return None, None, None, None, None, None, None, None
-
-            # Sort by modification time (newest first)
-            pth_files.sort(key=os.path.getctime, reverse=True)
-
-            print("\nAvailable model files (newest first):")
-            for i, file_path in enumerate(pth_files, 1):
-                file_size = os.path.getsize(file_path) / (1024 * 1024)  # Size in MB
-                mod_time = os.path.getctime(file_path)
-                from datetime import datetime
-                mod_time_str = datetime.fromtimestamp(mod_time).strftime('%Y-%m-%d %H:%M:%S')
-                print(f"{i}. {os.path.basename(file_path)} ({file_size:.1f} MB, {mod_time_str})")
-
-            while True:
-                try:
-                    choice = input("\nEnter the number of the model file to load (or 'q' to quit): ").strip()
-                    if choice.lower() == 'q':
-                        return None, None, None, None, None, None, None, None
-                    choice_idx = int(choice) - 1
-                    if 0 <= choice_idx < len(pth_files):
-                        model_file = pth_files[choice_idx]
-                        break
-                    else:
-                        print(f"Please enter a number between 1 and {len(pth_files)}")
-                except ValueError:
-                    print("Please enter a valid number or 'q' to quit")
-        else:
-            import tkinter as tk
-            from tkinter import filedialog
-            model_file = filedialog.askopenfilename(filetypes=[("PyTorch Model Files", "*.pth")])
+        model_file = checkpoint_path
 
         if model_file:
             checkpoint = torch.load(model_file, map_location="cpu")
@@ -683,10 +735,8 @@ def load_model_file(frommain=False):
             has_factorized_heads = any('from_head' in key for key in state_dict.keys())
             has_mobile_llm_features = any('rms_1' in key or 'swiglu' in key for key in state_dict.keys())
 
-            # Import ChessModel from brain module (used by both classic and 4-token)
-            import sys, os
-            sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-            from Chess_Brain_WB_2_12_26 import ChessModel, create_classic_move_to_idx, create_classic_idx_to_move
+            # ChessModel, create_classic_move_to_idx, create_classic_idx_to_move
+            # are defined above in this file (no Chess_Brain dependency needed at inference)
 
             # Classic mode: format_version 3, or has lm_head + rms blocks
             if token_mode == 'classic' or (fmt_version >= 3 and has_lm_head):
@@ -803,7 +853,10 @@ def load_model_file(frommain=False):
             print(f"Model token mode: {token_mode}")
 
             return model, vocab_size, n_embd, n_head, block_size, n_layer, dropout, tokenizer
-            
+
+        print("No model file selected.")
+        return None, None, None, None, None, None, None, None
+
     except Exception as e:
         print(f"An error occurred: {e}")
         return None, None, None, None, None, None, None, None
@@ -1076,7 +1129,7 @@ def generate_response(model, tokenizer, tokenizer_reverse, input_text,
 #   - Used for: ChessBrain integration, move prediction API
 
 
-def initialize_model():
+def initialize_model(checkpoint_path=None):
     """
     Initialize global model state for chess inference API usage.
 
@@ -1088,17 +1141,26 @@ def initialize_model():
     - global_tokenizer: Chess move tokenizer (dict)
     - global_tokenizer_reverse: Reverse mapping for move decoding
 
+    Args:
+        checkpoint_path: Path to a .pth file. If None, returns None (caller must supply a path).
+
     Returns:
         Loaded model instance, or None if loading failed
 
     Usage:
-        initialize_model()  # Load once
+        initialize_model(checkpoint_path="/path/to/model.pth")
         # Then use global_model for multiple chess inferences
     """
     global global_model, global_tokenizer, global_tokenizer_reverse
 
+    if not checkpoint_path:
+        print("initialize_model: checkpoint_path is required.")
+        return None
+
     # Load chess model
-    model, vocab_size, n_embd, n_head, block_size, n_layer, dropout, tokenizer = load_model_file()
+    model, vocab_size, n_embd, n_head, block_size, n_layer, dropout, tokenizer = load_model_file(
+        checkpoint_path=checkpoint_path
+    )
     if model is None:
         print("Failed to load chess model.")
         return None

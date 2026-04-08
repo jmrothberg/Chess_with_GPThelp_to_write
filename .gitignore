@@ -87,3 +87,7 @@ combined_chess_datasets/
 # Model files (too large for git)
 *.pth
 *.whl
+
+# Neural checkpoints live under Chess_LLM_models/ locally; keep only the directory in git
+Chess_LLM_models/*
+!Chess_LLM_models/.gitkeep

@@ -21,12 +21,17 @@ import pygame
 import copy
 import time
 import os
+import glob
 import string
 import json
-import Chess_Inference_WB_2_12_26 as brain_inference
-from Chess_Inference_WB_2_12_26 import generate_response
+import Chess_Inference as brain_inference
+from Chess_Inference import generate_response
 from game_selector3D import loop_to_select_new_game, draw_pieces_not_on_board
 import platform
+import random
+import subprocess
+import multiprocessing
+import math
 try:
     from numba import jit, int32, float32
     NUMBA_AVAILABLE = True
@@ -58,6 +63,11 @@ ai_method_black = "Improved"
 llm_white = None
 llm_black = None
 block_size = None
+
+# Pygame-only .pth picker (no tkinter — avoids macOS crash with SDL/pygame)
+llm_picker_for = None
+llm_picker_page = 0
+llm_picker_paths = []
 
 # LLM move statistics tracking
 llm_stats = {
@@ -749,233 +759,15 @@ def simulate_move(board, move, real_board=False):
 
 
 # ======================================================================================
-# MINIMAX WITH ALPHA-BETA PRUNING ALGORITHM
+# MINIMAX WITH ALPHA-BETA (in-place board, Zobrist TT, incremental PST+material, ID, optional parallel root)
 # ======================================================================================
-#
-# This is the core recursive search function that evaluates chess positions.
-#
-# HOW IT WORKS:
-# 1. Uses minimax algorithm: maximize for AI's turn, minimize for opponent's turn
-# 2. Alpha-beta pruning: 'alpha' tracks best score for maximizing player (AI),
-#    'beta' tracks best score for minimizing player (opponent)
-# 3. When alpha >= beta, the current branch is pruned (won't affect final decision)
-# 4. Returns both evaluation score and best move sequence for current depth
-#
-# KEY OPTIMIZATIONS:
-# - Transposition table lookup (30-60% speedup)
-# - Killer move heuristic for better move ordering
-# - Null move pruning (test if position is so good opponent can pass)
-# - Late move reduction (search less deeply for later moves)
-# - Quiescence search at leaf nodes for tactical stability
-#
 
-def select_best_ai_move_improved(board, depth, color, AI_color, alpha=float('-inf'), beta=float('inf'), display_simulation=False, last_move=None, initial_depth=None):
-    global transposition_table, piece_values, depth_formula, discount
-
-    # Use optimizations
-    use_transposition = True
-    use_killer_moves = True
-
-    # Transposition table lookup
-    board_key = (tuple(map(tuple, board)), color, AI_color)  # Include whose turn it is and which AI is playing
-    if use_transposition and board_key in transposition_table:
-        eval_board, eval_depth, best_move_new = transposition_table[board_key]
-        if display_simulation:
-           print(f"Transposition Table hit for {color} {depth} {eval_board:.2f} {eval_depth} {best_move_new} {last_move}")
-        if eval_depth >= depth:
-            return eval_board, best_move_new
-
-    legal_moves = get_all_legal_moves(board, color, last_move=last_move, check_legality=True)
-    
-    # DEBUG: Check if legal_moves is unexpectedly empty at top level
-    if depth == initial_depth:
-        print(f"DEBUG ENTRY: color={color}, depth={depth}, initial={initial_depth}, legal_moves={len(legal_moves)}")
-    
-    check = is_in_check(board, color)
-
-    evaluation = evaluate_board(board)
-
-    if not check and not legal_moves:
-        evaluation = evaluation * (discount**((initial_depth + 1) - depth))
-        if display_simulation:
-            print(f"Stalemate, no legal moves for {color}. Evaluation: {-evaluation:.2f}")
-            print(f"Depth: {depth}, Last move: {last_move}")
-        return -evaluation, []
-
-    if check and not legal_moves:
-        if color == "W":
-            evaluation = (evaluation - 100) * (discount**((initial_depth + 1) - depth))
-        else:
-            evaluation = (evaluation + 100) * (discount**((initial_depth + 1) - depth))
-        if display_simulation:
-            print(f"Checkmate of {color}. Evaluation: {evaluation:.2f}")
-            print(f"Depth: {depth}, Last move: {last_move} of {'W' if color == 'B' else 'B'}")
-        return evaluation, []
-
-    if depth <= 0:
-        return quiescence_search(board, color, AI_color, alpha, beta, 0, 2)
-
-    # ======================================================================================
-    # NULL MOVE PRUNING OPTIMIZATION
-    # ======================================================================================
-    #
-    # Allows opponent to "pass" their turn to test position strength.
-    #
-    # HOW IT WORKS:
-    # 1. Temporarily give opponent an extra move (null move)
-    # 2. If opponent still can't create a threat, position must be very strong
-    # 3. Reduces search tree by pruning weak positions early
-    # 4. Only used when not in check (passing when in check is illegal)
-    # 5. Uses reduced depth (depth-3) for efficiency
-    #
-    # EXAMPLE: If current position is so good that opponent gains nothing from extra move,
-    # then we can prune this branch and avoid deeper search.
-    #
-    # ======================================================================================
-    # Null Move Pruning (not at root level - must return actual move at root)
-    if depth > 2 and not check and depth < initial_depth:
-        null_move_eval, _ = select_best_ai_move_improved(board, depth - 3, 'B' if color == 'W' else 'W', AI_color, -beta, -beta + 1, display_simulation, last_move, initial_depth)
-        null_move_eval = -null_move_eval
-        if null_move_eval >= beta:
-            return beta, []
-
-    # ======================================================================================
-    # MOVE ORDERING HEURISTIC - CRITICAL FOR ALPHA-BETA EFFICIENCY
-    # ======================================================================================
-    #
-    # Orders moves to improve alpha-beta pruning effectiveness.
-    # Better ordered moves = more pruning = faster search.
-    #
-    # ORDERING CRITERIA (highest priority first):
-    # 1. Killer Moves: Moves that caused beta cutoffs at same depth in other branches
-    # 2. Captures: MVV-LVA (Most Valuable Victim - Least Valuable Attacker)
-    #    - Queen takes Pawn (high priority - saves queen)
-    #    - Pawn takes Queen (high priority - gains queen)
-    # 3. Center control and advancement bonuses
-    # 4. Pawn promotions (very high priority)
-    #
-    # Killer moves work because: if a move caused cutoff elsewhere, likely good here too
-    #
-    # ======================================================================================
-    # Move Ordering with killer moves heuristic
-    def order_moves(board, moves, color):
-        global killer_moves
-        ordered_moves = []
-        for move in moves:
-            score = 0
-            piece = board[move[0][0]][move[0][1]]
-            target = board[move[1][0]][move[1][1]]
-
-            # Check if this is a killer move (beta cutoff move from previous iterations)
-            if use_killer_moves:
-                for depth_idx in range(min(depth, len(killer_moves))):
-                    if killer_moves[depth_idx][0] == move or killer_moves[depth_idx][1] == move:
-                        score += 1000  # High priority for killer moves
-
-            if target:
-                score += 10 * abs(piece_values.get(target, 0)) - abs(piece_values.get(piece, 0))
-
-            score += (3 - abs(3.5 - move[1][1])) + (3 - abs(3.5 - move[1][0]))
-
-            if piece[1] == 'P' and (move[1][0] == 0 or move[1][0] == 7):
-                score += 900
-
-            ordered_moves.append((move, score))
-
-        return sorted(ordered_moves, key=lambda x: x[1], reverse=(color == 'W'))
-
-    scored_moves = order_moves(board, legal_moves, color)
-
-    length = len(scored_moves)
-    if length > eval(depth_formula):
-        scored_moves = scored_moves[:eval(depth_formula)]
-
-    # DEBUG: Check if moves are being eliminated
-    if display_simulation or len(scored_moves) == 0:
-        print(f"DEBUG: depth={depth}, color={color}, legal_moves={len(legal_moves)}, scored_moves={len(scored_moves)}, formula={depth_formula}, eval={eval(depth_formula) if length > 0 else 'N/A'}")
-
-    best_eval = float('-inf') if color == AI_color else float('inf')
-    best_move_new = []
-
-    for move_index, (move, _) in enumerate(scored_moves):
-        new_board = simulate_move(board, move, real_board=False)
-
-        # ======================================================================================
-        # LATE MOVE REDUCTION OPTIMIZATION
-        # ======================================================================================
-        #
-        # Assumes later moves in ordered list are less likely to be best moves.
-        #
-        # HOW IT WORKS:
-        # 1. For moves after first 3-4 in ordered list, search at reduced depth (depth-2)
-        # 2. If reduced-depth search doesn't improve alpha, skip full-depth search
-        # 3. Based on principle: best moves are usually found early in ordering
-        # 4. Only applied when not in check and not capturing (tactical moves need full depth)
-        #
-        # SIGNIFICANT SPEEDUP: Reduces branching factor for unpromising moves
-        #
-        # ======================================================================================
-        # Late Move Reduction
-        if depth >= 3 and move_index > 3 and not check and not board[move[1][0]][move[1][1]]:
-            eval_board, opponent_best_move = select_best_ai_move_improved(new_board, depth-2, 'B' if color == 'W' else 'W', AI_color, alpha, beta, display_simulation, move, initial_depth)
-            if (color == AI_color and eval_board < alpha) or (color != AI_color and eval_board > beta):
-                continue
-
-        eval_board, opponent_best_move = select_best_ai_move_improved(new_board, depth-1, 'B' if color == 'W' else 'W', AI_color, alpha, beta, display_simulation, move, initial_depth)
-
-        # Update bounds immediately with current move evaluation
-        if color == AI_color:
-            alpha = max(alpha, eval_board)
-        else:
-            beta = min(beta, eval_board)
-
-        # Update best move if this evaluation is better
-        if (color == AI_color and eval_board > best_eval) or (color != AI_color and eval_board < best_eval):
-            best_eval = eval_board
-            best_move_new = [move] + opponent_best_move if opponent_best_move else [move]
-
-        if beta <= alpha:
-            # Store killer move for better move ordering in future searches
-            if use_killer_moves and depth < len(killer_moves):
-                if killer_moves[depth][0] != move:
-                    killer_moves[depth][1] = killer_moves[depth][0]  # Shift previous killer move
-                    killer_moves[depth][0] = move  # Store new killer move
-            break
-
-    if use_transposition:
-        transposition_table[board_key] = best_eval, depth, best_move_new
-    
-    # DEBUG: Print what we're returning if it's empty at top level
-    if depth == initial_depth and len(best_move_new) == 0:
-        print(f"WARNING at return: empty move! depth={depth}, color={color}, AI_color={AI_color}, legal={len(legal_moves)}, scored was={length}")
-    
-    return best_eval, best_move_new
-
-# ======================================================================================
-# QUIESCENCE SEARCH ALGORITHM
-# ======================================================================================
-#
-# Solves the "horizon effect" where tactical threats are missed just beyond search depth.
-#
-# HOW IT WORKS:
-# 1. At leaf nodes of main search, continues searching captures only
-# 2. Ensures tactical stability - won't evaluate position where captures are still possible
-# 3. Stops when no captures available or max depth reached
-# 4. Uses "stand pat" evaluation - current position value if no capture is forced
-# 5. Alpha-beta pruning applied to captures for efficiency
-#
-# MVV-LVA ORDERING:
-# Sorts captures by Most Valuable Victim minus Least Valuable Attacker
-# Prioritizes queen captures, then rook captures, etc.
-# Example: Pawn takes Queen = high priority, Queen takes Pawn = lower priority
-#
-# ======================================================================================
-def quiescence_search(board, color, AI_color, alpha, beta, depth, max_depth):
-    stand_pat = evaluate_board(board)
+def _quiescence_search_inner(board, color, AI_color, alpha, beta, depth, max_depth, pst_material):
+    stand_pat = _eval_from_pst(board, pst_material)
     if depth >= max_depth:
         return stand_pat, []
 
-    if color == 'W':
+    if color == "W":
         if stand_pat >= beta:
             return beta, []
         if stand_pat > alpha:
@@ -986,10 +778,9 @@ def quiescence_search(board, color, AI_color, alpha, beta, depth, max_depth):
         if stand_pat < beta:
             beta = stand_pat
 
-    captures = [move for move in get_all_legal_moves(board, color, check_legality=True) if board[move[1][0]][move[1][1]] != '']
+    captures = [m for m in get_all_legal_moves(board, color, check_legality=True) if board[m[1][0]][m[1][1]] != ""]
     best_move = []
 
-    # Sort captures by most valuable victim and least valuable attacker (MVV-LVA)
     def capture_value(move):
         attacker = board[move[0][0]][move[0][1]]
         victim = board[move[1][0]][move[1][1]]
@@ -998,10 +789,14 @@ def quiescence_search(board, color, AI_color, alpha, beta, depth, max_depth):
     captures.sort(key=capture_value, reverse=True)
 
     for move in captures:
-        new_board = simulate_move(board, move, real_board=False)
-        score, _ = quiescence_search(new_board, 'B' if color == 'W' else 'W', AI_color, -beta, -alpha, depth + 1, max_depth)
+        undo, delta = search_apply_move(board, move, None)
+        child_pst = pst_material + delta
+        score, _ = _quiescence_search_inner(
+            board, "B" if color == "W" else "W", AI_color, -beta, -alpha, depth + 1, max_depth, child_pst,
+        )
+        search_undo_move(board, undo)
         score = -score
-        if color == 'W':
+        if color == "W":
             if score > alpha:
                 alpha = score
                 best_move = [move]
@@ -1014,13 +809,249 @@ def quiescence_search(board, color, AI_color, alpha, beta, depth, max_depth):
             if beta <= alpha:
                 return alpha, best_move
 
-    return (alpha if color == 'W' else beta, best_move)
+    return (alpha if color == "W" else beta, best_move)
 
 
+def _select_best_ai_move_inner(
+    board, depth, color, AI_color, alpha, beta, display_simulation, last_move, initial_depth, inc_eval=None, pv_first_move=None,
+):
+    global transposition_table, piece_values, depth_formula, discount, killer_moves
+
+    use_transposition = True
+    use_killer_moves = True
+
+    if inc_eval is None:
+        pst_acc = _evaluate_pst_material(board)
+    else:
+        pst_acc = inc_eval
+
+    # Minimax value is side-independent; key is position + side to move (not AI_color).
+    board_key = (zobrist_hash_board(board, color), color)
+    if use_transposition and board_key in transposition_table:
+        eval_board, eval_depth, best_move_new = transposition_table[board_key]
+        if display_simulation:
+            print(f"TT hit {color} d={depth} {eval_board:.2f} stored_d={eval_depth}")
+        if eval_depth >= depth:
+            return eval_board, best_move_new
+
+    legal_moves = get_all_legal_moves(board, color, last_move=last_move, check_legality=True)
+    check = is_in_check(board, color)
+    # Do not call full evaluate_board() here — it runs extensions (was 2× movegen for mobility) per node and dominates cost.
+    if not check and not legal_moves:
+        evaluation = _eval_from_pst(board, pst_acc) * (discount ** ((initial_depth + 1) - depth))
+        if display_simulation:
+            print(f"Stalemate {color} eval {-evaluation:.2f}")
+        return -evaluation, []
+
+    if check and not legal_moves:
+        evaluation = _eval_from_pst(board, pst_acc)
+        if color == "W":
+            evaluation = (evaluation - 100) * (discount ** ((initial_depth + 1) - depth))
+        else:
+            evaluation = (evaluation + 100) * (discount ** ((initial_depth + 1) - depth))
+        if display_simulation:
+            print(f"Checkmate {color} eval {evaluation:.2f}")
+        return evaluation, []
+
+    if depth <= 0:
+        return _quiescence_search_inner(board, color, AI_color, alpha, beta, 0, 2, pst_acc)
+
+    # Null-move pruning (white-centric scores: White maximizes, Black minimizes — no negamax flip).
+    if depth > 2 and not check and depth < initial_depth:
+        opp = "B" if color == "W" else "W"
+        if color == "W":
+            null_move_eval, _ = _select_best_ai_move_inner(
+                board, depth - 3, opp, AI_color, beta - 1, beta,
+                display_simulation, last_move, initial_depth, pst_acc, None,
+            )
+            if null_move_eval >= beta:
+                return beta, []
+        else:
+            null_move_eval, _ = _select_best_ai_move_inner(
+                board, depth - 3, opp, AI_color, alpha, alpha + 1,
+                display_simulation, last_move, initial_depth, pst_acc, None,
+            )
+            if null_move_eval <= alpha:
+                return alpha, []
+
+    def order_moves(bd, moves, clr, pv_move):
+        global killer_moves
+        ordered_moves = []
+        for move in moves:
+            score = 0
+            if pv_move is not None and move == pv_move:
+                score += 2500
+            piece = bd[move[0][0]][move[0][1]]
+            target = bd[move[1][0]][move[1][1]]
+            if use_killer_moves:
+                for depth_idx in range(min(depth, len(killer_moves))):
+                    if killer_moves[depth_idx][0] == move or killer_moves[depth_idx][1] == move:
+                        score += 1000
+            if target:
+                score += 10 * abs(piece_values.get(target, 0)) - abs(piece_values.get(piece, 0))
+            score += (3 - abs(3.5 - move[1][1])) + (3 - abs(3.5 - move[1][0]))
+            if piece[1] == "P" and (move[1][0] == 0 or move[1][0] == 7):
+                score += 900
+            ordered_moves.append((move, score))
+        return sorted(ordered_moves, key=lambda x: x[1], reverse=(clr == "W"))
+
+    length = len(legal_moves)
+    pv_move = pv_first_move if depth == initial_depth else None
+    scored_moves = order_moves(board, legal_moves, color, pv_move)
+    if length > eval(depth_formula):
+        scored_moves = scored_moves[: eval(depth_formula)]
+
+    if display_simulation or len(scored_moves) == 0:
+        print(f"DEBUG: depth={depth} color={color} legal={len(legal_moves)} scored={len(scored_moves)}")
+
+    # Always: side to move maximizes iff White (eval is white-positive); Black minimizes.
+    best_eval = float("-inf") if color == "W" else float("inf")
+    best_move_new = []
+    opp = "B" if color == "W" else "W"
+
+    for move_index, (move, _) in enumerate(scored_moves):
+        tgt_before = board[move[1][0]][move[1][1]]
+        undo, delta = search_apply_move(board, move, last_move)
+        child_pst = pst_acc + delta
+
+        if depth >= 3 and move_index > 3 and not check and not tgt_before:
+            eval_board, opponent_best_move = _select_best_ai_move_inner(
+                board, depth - 2, opp, AI_color, alpha, beta, display_simulation, move, initial_depth, child_pst, None,
+            )
+            if (color == "W" and eval_board < alpha) or (color == "B" and eval_board > beta):
+                search_undo_move(board, undo)
+                continue
+
+        eval_board, opponent_best_move = _select_best_ai_move_inner(
+            board, depth - 1, opp, AI_color, alpha, beta, display_simulation, move, initial_depth, child_pst, None,
+        )
+        search_undo_move(board, undo)
+
+        if color == "W":
+            alpha = max(alpha, eval_board)
+        else:
+            beta = min(beta, eval_board)
+
+        if (color == "W" and eval_board > best_eval) or (color == "B" and eval_board < best_eval):
+            best_eval = eval_board
+            best_move_new = [move] + opponent_best_move if opponent_best_move else [move]
+
+        if beta <= alpha:
+            if use_killer_moves and depth < len(killer_moves):
+                if killer_moves[depth][0] != move:
+                    killer_moves[depth][1] = killer_moves[depth][0]
+                    killer_moves[depth][0] = move
+            break
+
+    if use_transposition:
+        transposition_table[board_key] = best_eval, depth, best_move_new
+
+    if depth == initial_depth and len(best_move_new) == 0:
+        print(f"WARNING: empty PV depth={depth} color={color} legal={len(legal_moves)}")
+
+    return best_eval, best_move_new
 
 
+def _fork_mp_context():
+    if sys.platform == "win32":
+        return None
+    try:
+        return multiprocessing.get_context("fork")
+    except ValueError:
+        return None
 
 
+def _root_search_worker(payload):
+    chunk, depth, color, AI_color, last_move, initial_depth = payload
+    board = chunk["board"]
+    moves = chunk["moves"]
+    global transposition_table, killer_moves
+    transposition_table = {}
+    killer_moves = [[None, None] for _ in range(20)]
+    best_eval = float("-inf") if color == "W" else float("inf")
+    best_line = []
+    opp = "B" if color == "W" else "W"
+    for move in moves:
+        undo, _d = search_apply_move(board, move, last_move)
+        pst = _evaluate_pst_material(board)
+        ev, pv = _select_best_ai_move_inner(
+            board, depth - 1, opp, AI_color, float("-inf"), float("inf"), False, move, initial_depth, pst, None,
+        )
+        search_undo_move(board, undo)
+        if (color == "W" and ev > best_eval) or (color == "B" and ev < best_eval):
+            best_eval = ev
+            best_line = [move] + (pv if pv else [])
+    return best_eval, best_line
+
+
+def _parallel_root_search(ctx, work_board, depth, color, AI_color, last_move, initial_depth, n_workers):
+    legal_moves = get_all_legal_moves(work_board, color, last_move=last_move, check_legality=True)
+    if not legal_moves:
+        return 0.0, []
+    n_workers = min(n_workers, len(legal_moves))
+    chunks = [[] for _ in range(n_workers)]
+    for i, m in enumerate(legal_moves):
+        chunks[i % n_workers].append(m)
+    payloads = []
+    for ch in chunks:
+        if not ch:
+            continue
+        b = [row[:] for row in work_board]
+        payloads.append(({"board": b, "moves": ch}, depth, color, AI_color, last_move, initial_depth))
+    with ctx.Pool(processes=len(payloads)) as pool:
+        results = pool.map(_root_search_worker, payloads)
+    best_eval = float("-inf") if color == "W" else float("inf")
+    best_line = []
+    for ev, ln in results:
+        if (color == "W" and ev > best_eval) or (color == "B" and ev < best_eval):
+            best_eval = ev
+            best_line = ln if ln else []
+    return best_eval, best_line
+
+
+def select_best_ai_move_improved(
+    board, depth, color, AI_color, alpha=float("-inf"), beta=float("inf"), display_simulation=False, last_move=None, initial_depth=None,
+):
+    global transposition_table, killer_moves
+    if initial_depth is None:
+        initial_depth = depth
+
+    sf = try_stockfish_move(board, depth, color, last_move)
+    if sf is not None:
+        return sf
+
+    work_board = [row[:] for row in board]
+    workers = int(os.environ.get("CHESS_SEARCH_WORKERS", "0") or "0")
+    ctx = _fork_mp_context()
+    if workers > 1 and ctx is not None and depth >= 3 and not display_simulation:
+        return _parallel_root_search(ctx, work_board, depth, color, AI_color, last_move, initial_depth, workers)
+
+    prev_score = 0.0
+    pv_hint = None
+    last_line = []
+    for d in range(1, depth + 1):
+        a, b = float("-inf"), float("inf")
+        if d > 1:
+            margin = 45.0
+            a, b = prev_score - margin, prev_score + margin
+        while True:
+            score, line = _select_best_ai_move_inner(
+                work_board, d, color, AI_color, a, b, display_simulation, last_move, d, None, pv_hint,
+            )
+            if d > 1 and (score <= a or score >= b):
+                a, b = float("-inf"), float("inf")
+                continue
+            break
+        prev_score = score
+        last_line = line
+        pv_hint = line[0] if line else None
+    return prev_score, last_line
+
+
+def quiescence_search(board, color, AI_color, alpha, beta, depth, max_depth):
+    """Legacy entry: in-place quiescence (mutates board — use on a copy)."""
+    pst = _evaluate_pst_material(board)
+    return _quiescence_search_inner(board, color, AI_color, alpha, beta, depth, max_depth, pst)
 
 
 def convert_to_standard_notation_simple(move):
@@ -1114,12 +1145,41 @@ def parse_llm_response(response, board, color):
     return parsed_moves
 
 
-def initialize_ai_model(color):
+def get_llm_checkpoint_dir():
+    """Directory for *.pth neural checkpoints. Default: Chess_LLM_models/ subfolder. Override with env CHESS_LLM_DIR."""
+    d = os.environ.get("CHESS_LLM_DIR", "").strip()
+    if d and os.path.isdir(d):
+        return os.path.abspath(d)
+    default = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Chess_LLM_models")
+    if os.path.isdir(default):
+        return default
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def list_llm_checkpoints():
+    """All .pth files in get_llm_checkpoint_dir(), newest first."""
+    d = get_llm_checkpoint_dir()
+    paths = glob.glob(os.path.join(d, "*.pth"))
+    paths.sort(key=os.path.getmtime, reverse=True)
+    return paths
+
+
+def friendly_ai_method_display(name):
+    """Status-bar label: neural transformer vs classical search (internal keys stay LLM / Improved)."""
+    if name == "LLM":
+        return "Neural"
+    if name == "Improved":
+        return "Search"
+    return name
+
+
+def initialize_ai_model(color, checkpoint_path=None):
+    """Load neural (transformer) weights for White or Black; checkpoint_path must be a real .pth file."""
     global llm_white, llm_black, block_size, ai_method_white, ai_method_black
 
     if color == 'W':
         print("Initializing white model...")
-        llm_white = brain_inference.initialize_model()
+        llm_white = brain_inference.initialize_model(checkpoint_path=checkpoint_path)
         if llm_white is None:
             print(f"Failed to initialize AI model for {color}.")
             return False
@@ -1127,7 +1187,7 @@ def initialize_ai_model(color):
         ai_method_white = "LLM"
     else:
         print("Initializing black model...")
-        llm_black = brain_inference.initialize_model()
+        llm_black = brain_inference.initialize_model(checkpoint_path=checkpoint_path)
         if llm_black is None:
             print(f"Failed to initialize AI model for {color}.")
             return False
@@ -1136,6 +1196,137 @@ def initialize_ai_model(color):
 
     print(f"AI model initialized successfully for {color}.")
     return True
+
+
+def draw_llm_picker_overlay(screen):
+    """In-window list of .pth files (no tkinter)."""
+    global llm_picker_for, llm_picker_page, llm_picker_paths
+    if llm_picker_for is None or not llm_picker_paths:
+        return
+    panel_top = 90
+    panel_h = 280
+    pygame.draw.rect(screen, OFF_WHITE, (18, panel_top, SCREEN_WIDTH - 36, panel_h))
+    pygame.draw.rect(screen, BLACK, (18, panel_top, SCREEN_WIDTH - 36, panel_h), 2)
+    small = pygame.font.SysFont("Arial", 18)
+    side_name = "White" if llm_picker_for == "W" else "Black"
+    d = get_llm_checkpoint_dir()
+    dir_short = d if len(d) <= 70 else "..." + d[-67:]
+    screen.blit(
+        small.render(f"Neural model for {side_name} — .pth files in: {dir_short}", True, BLACK),
+        (28, panel_top + 8),
+    )
+    screen.blit(
+        small.render("Keys: 1-9 pick   [ prev page   ] next page   Esc cancel", True, BLACK),
+        (28, panel_top + 30),
+    )
+    n = len(llm_picker_paths)
+    num_pages = max(1, (n + 8) // 9)
+    start = llm_picker_page * 9
+    for i in range(9):
+        idx = start + i
+        if idx >= n:
+            break
+        line = f"{i + 1}. {os.path.basename(llm_picker_paths[idx])}"
+        screen.blit(small.render(line, True, BLACK), (28, panel_top + 54 + i * 24))
+    screen.blit(
+        small.render(f"Page {llm_picker_page + 1} / {num_pages}  ({n} files)", True, BLACK),
+        (SCREEN_WIDTH - 220, panel_top + 8),
+    )
+
+
+def handle_llm_picker_keydown(event):
+    """Handle keys while checkpoint picker is open. Returns True (caller should redraw)."""
+    global llm_picker_for, llm_picker_page, llm_picker_paths, ai_method_white, ai_method_black
+    side = llm_picker_for
+    n = len(llm_picker_paths)
+    digit_map = {
+        pygame.K_1: 0, pygame.K_2: 1, pygame.K_3: 2, pygame.K_4: 3, pygame.K_5: 4,
+        pygame.K_6: 5, pygame.K_7: 6, pygame.K_8: 7, pygame.K_9: 8,
+    }
+    if event.key == pygame.K_ESCAPE:
+        llm_picker_for = None
+        llm_picker_paths = []
+        print("Checkpoint picker cancelled.")
+        return True
+    if event.key == pygame.K_LEFTBRACKET:
+        llm_picker_page = max(0, llm_picker_page - 1)
+        return True
+    if event.key == pygame.K_RIGHTBRACKET:
+        max_page = max(0, (n - 1) // 9)
+        llm_picker_page = min(max_page, llm_picker_page + 1)
+        return True
+    if event.key in digit_map:
+        idx = llm_picker_page * 9 + digit_map[event.key]
+        if idx < n:
+            path = llm_picker_paths[idx]
+            prev_w, prev_b = ai_method_white, ai_method_black
+            if side == "W":
+                ai_method_white = "LLM"
+            else:
+                ai_method_black = "LLM"
+            if not initialize_ai_model(side, checkpoint_path=path):
+                ai_method_white, ai_method_black = prev_w, prev_b
+            llm_picker_for = None
+            llm_picker_paths = []
+        return True
+    return True
+
+
+def start_llm_picker(for_color):
+    """Open pygame list of local .pth files for White ('W') or Black ('B')."""
+    global llm_picker_for, llm_picker_page, llm_picker_paths, ai_method_white, ai_method_black
+    paths = list_llm_checkpoints()
+    d = get_llm_checkpoint_dir()
+    if not paths:
+        print(f"No .pth files in {d} — copy checkpoints here or set CHESS_LLM_DIR.")
+        return
+    if len(paths) == 1:
+        prev_w, prev_b = ai_method_white, ai_method_black
+        if for_color == "W":
+            ai_method_white = "LLM"
+        else:
+            ai_method_black = "LLM"
+        if not initialize_ai_model(for_color, checkpoint_path=paths[0]):
+            ai_method_white, ai_method_black = prev_w, prev_b
+        return
+    llm_picker_paths = paths
+    llm_picker_page = 0
+    llm_picker_for = for_color
+    print(f"Pick .pth for {for_color}: 1-9, [ ], Esc. Folder: {d}")
+
+
+def cycle_ai_method_for_side(color):
+    """Cycle Search (minimax) <-> Neural (transformer) for White or Black; neural needs a loaded .pth (use , or . to pick)."""
+    global ai_method_white, ai_method_black
+    keys = list(ai_methods.keys())
+    if color == "W":
+        idx = keys.index(ai_method_white)
+        new_m = keys[(idx + 1) % len(keys)]
+        if new_m == "LLM":
+            if llm_white is not None:
+                ai_method_white = "LLM"
+                print("White side: Neural (transformer) — using loaded checkpoint.")
+            else:
+                print("White side: no .pth loaded yet — press W to pick a checkpoint.")
+                start_llm_picker("W")
+        else:
+            ai_method_white = new_m
+            print(f"White side: {friendly_ai_method_display(ai_method_white)} engine (minimax / alpha-beta).")
+    else:
+        idx = keys.index(ai_method_black)
+        new_m = keys[(idx + 1) % len(keys)]
+        if new_m == "LLM":
+            if llm_black is not None:
+                ai_method_black = "LLM"
+                print("Black side: Neural (transformer) — using loaded checkpoint.")
+            else:
+                print("Black side: no .pth loaded yet — press B to pick a checkpoint.")
+                start_llm_picker("B")
+        else:
+            ai_method_black = new_m
+            print(f"Black side: {friendly_ai_method_display(ai_method_black)} engine (minimax / alpha-beta).")
+
+
 def select_best_ai_move_llm(board, depth, color, AI_color, alpha=float('-inf'), beta=float('inf'), display_simulation=False, last_move=None, initial_depth=None):
     """AI method that uses the LLM for move selection."""
     global game_history_simple, llm_white, llm_black
@@ -1271,12 +1462,10 @@ def convert_to_standard_notation(board, move):
 #
 # ======================================================================================
 # Evaluate the board for given state (basic evaluation without consideration of checkmate or check)
-def evaluate_board_positions_optimized(board):
+def _evaluate_pst_material(board):
+    """Material + piece-square only (used for incremental search eval)."""
     global piece_values, get_pos_val_white, get_pos_val_black
-
     evaluation = 0
-
-    # Use globally precomputed positional values for maximum speed
     for i in range(8):
         row = board[i]
         for j in range(8):
@@ -1287,9 +1476,351 @@ def evaluate_board_positions_optimized(board):
                 value = piece_values.get(piece, 0)
                 pos_val = get_pos_val_white.get((piece_type, i, j), 0) if is_white else get_pos_val_black.get((piece_type, i, j), 0)
                 evaluation += value + pos_val
-
     return evaluation
 
+
+def evaluate_board_extensions(board):
+    """Handcrafted terms: passed pawns, doubled/isolated pawns, simple king safety (no NN). Kept cheap for search."""
+    w_passed = 0.0
+    b_passed = 0.0
+    w_pawn_cols = [0] * 8
+    b_pawn_cols = [0] * 8
+    wk = bk = None
+    for i in range(8):
+        for j in range(8):
+            p = board[i][j]
+            if not p:
+                continue
+            if p[1] == 'P':
+                if p[0] == 'W':
+                    w_pawn_cols[j] += 1
+                else:
+                    b_pawn_cols[j] += 1
+            if p == 'WK':
+                wk = (i, j)
+            elif p == 'BK':
+                bk = (i, j)
+    for j in range(8):
+        if w_pawn_cols[j]:
+            path_clear = True
+            for jj in range(j - 1, j + 2):
+                if jj < 0 or jj > 7 or jj == j:
+                    continue
+                if b_pawn_cols[jj]:
+                    path_clear = False
+                    break
+            if path_clear:
+                for i in range(8):
+                    if board[i][j] == 'WP':
+                        w_passed += 0.15 * (7 - i)
+        if b_pawn_cols[j]:
+            path_clear = True
+            for jj in range(j - 1, j + 2):
+                if jj < 0 or jj > 7 or jj == j:
+                    continue
+                if w_pawn_cols[jj]:
+                    path_clear = False
+                    break
+            if path_clear:
+                for i in range(8):
+                    if board[i][j] == 'BP':
+                        b_passed += 0.15 * i
+    doubled_iso = 0.0
+    for j in range(8):
+        wcount = w_pawn_cols[j]
+        bcount = b_pawn_cols[j]
+        if wcount >= 2:
+            doubled_iso -= 0.08 * wcount
+        if bcount >= 2:
+            doubled_iso += 0.08 * bcount
+        if wcount == 1:
+            iso = True
+            if j > 0 and w_pawn_cols[j - 1]:
+                iso = False
+            if j < 7 and w_pawn_cols[j + 1]:
+                iso = False
+            if iso:
+                doubled_iso -= 0.05
+        if bcount == 1:
+            iso = True
+            if j > 0 and b_pawn_cols[j - 1]:
+                iso = False
+            if j < 7 and b_pawn_cols[j + 1]:
+                iso = False
+            if iso:
+                doubled_iso += 0.05
+    king_s = 0.0
+    if wk:
+        wr, wc = wk
+        shield = 0
+        if wr == 7:
+            for dc in (-1, 0, 1):
+                cc = wc + dc
+                if 0 <= cc < 8 and wr - 1 >= 0 and board[wr - 1][cc] == 'WP':
+                    shield += 1
+            king_s += 0.12 * shield
+        king_s -= 0.02 * (abs(3.5 - wc) + abs(6.5 - wr))
+    if bk:
+        br, bc = bk
+        shield = 0
+        if br == 0:
+            for dc in (-1, 0, 1):
+                cc = bc + dc
+                if 0 <= cc < 8 and br + 1 < 8 and board[br + 1][cc] == 'BP':
+                    shield += 1
+            king_s -= 0.12 * shield
+        king_s += 0.02 * (abs(3.5 - bc) + abs(0.5 - br))
+    # Mobility via full legal movegen was removed: it was called inside quiescence stand-pat and made search ~10–100× slower.
+    return (w_passed - b_passed) + doubled_iso + king_s
+
+
+def evaluate_board_positions_optimized(board):
+    return _evaluate_pst_material(board) + evaluate_board_extensions(board)
+
+
+def _piece_square_score(piece, r, c):
+    if not piece:
+        return 0.0
+    is_white = piece[0] == 'W'
+    pt = piece[1]
+    v = piece_values.get(piece, 0)
+    pv = get_pos_val_white.get((pt, r, c), 0) if is_white else get_pos_val_black.get((pt, r, c), 0)
+    return v + pv
+
+
+def _init_zobrist():
+    rng = random.Random(0xC055C4EC)
+    keys = {}
+    squares = 64
+    piece_syms = list(piece_values.keys())
+    for sq in range(squares):
+        for ps in piece_syms:
+            keys[(sq, ps)] = rng.getrandbits(64)
+    keys["side"] = rng.getrandbits(64)
+    return keys
+
+
+_ZOBRIST = _init_zobrist()
+
+
+def zobrist_hash_board(board, side_to_move):
+    h = 0
+    for i in range(8):
+        for j in range(8):
+            p = board[i][j]
+            if p:
+                sq = i * 8 + j
+                h ^= _ZOBRIST.get((sq, p), 0)
+    if side_to_move == "B":
+        h ^= _ZOBRIST["side"]
+    return h
+
+
+def search_apply_move(board, move, last_move):
+    """Apply move in-place for search; returns undo dict and PST+material delta (extensions unchanged)."""
+    (sr, sc), (er, ec) = move
+    piece = board[sr][sc]
+    captured = board[er][ec]
+    undo = {
+        "sr": sr, "sc": sc, "er": er, "ec": ec,
+        "moved": piece, "captured": captured,
+        "castle": None, "ep": None, "promo_from": None,
+    }
+    delta = 0.0
+    delta -= _piece_square_score(piece, sr, sc)
+    new_piece = piece
+    if piece[1] == "P" and (er == 0 or er == 7):
+        tmp = [row[:] for row in board]
+        tmp[er][ec] = piece[0] + "Q"
+        tmp[sr][sc] = ""
+        opp = "B" if piece[0] == "W" else "W"
+        if is_checkmate(tmp, opp):
+            new_piece = piece[0] + "N"
+        else:
+            new_piece = piece[0] + "Q"
+        undo["promo_from"] = piece
+    if piece[1] == "P" and captured == "" and sc != ec:
+        cap_row = er + 1 if piece[0] == "W" else er - 1
+        cap_col = ec
+        ep_pawn = board[cap_row][cap_col]
+        delta -= _piece_square_score(ep_pawn, cap_row, cap_col)
+        board[cap_row][cap_col] = ""
+        undo["ep"] = (cap_row, cap_col, ep_pawn)
+    if piece[1] == "K" and abs(ec - sc) == 2:
+        color = piece[0]
+        rook_from_c = 7 if ec > sc else 0
+        rook_to_c = sc + 1 if ec > sc else sc - 1
+        rook_sq = board[sr][rook_from_c]
+        delta -= _piece_square_score(rook_sq, sr, rook_from_c)
+        board[sr][rook_to_c] = rook_sq
+        board[sr][rook_from_c] = ""
+        delta += _piece_square_score(rook_sq, sr, rook_to_c)
+        undo["castle"] = (sr, rook_from_c, rook_to_c, rook_sq)
+    if captured:
+        delta -= _piece_square_score(captured, er, ec)
+    board[er][ec] = new_piece
+    board[sr][sc] = ""
+    delta += _piece_square_score(new_piece, er, ec)
+    return undo, delta
+
+
+def search_undo_move(board, undo):
+    sr, sc, er, ec = undo["sr"], undo["sc"], undo["er"], undo["ec"]
+    moved = undo["moved"]
+    captured = undo["captured"]
+    if undo["castle"]:
+        srr, rfc, rtc, rsq = undo["castle"]
+        board[er][ec] = ""
+        board[sr][sc] = moved
+        board[srr][rtc] = ""
+        board[srr][rfc] = rsq
+        return
+    if undo["ep"]:
+        board[er][ec] = ""
+        epr, epc, epp = undo["ep"]
+        board[epr][epc] = epp
+        board[sr][sc] = moved
+        return
+    if undo["promo_from"]:
+        board[er][ec] = captured
+        board[sr][sc] = undo["promo_from"]
+        return
+    board[er][ec] = captured
+    board[sr][sc] = moved
+
+
+def _eval_from_pst(board, pst_material):
+    return pst_material + evaluate_board_extensions(board)
+
+
+def _stockfish_path():
+    p = os.environ.get("CHESS_STOCKFISH", "").strip()
+    if p and os.path.isfile(p):
+        return p
+    for name in ("stockfish",):
+        try:
+            r = subprocess.run(["which", name], capture_output=True, text=True, timeout=2)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            pass
+    return None
+
+
+def board_to_fen(board, side_to_move, last_move, has_moved_ref):
+    """Minimal FEN for UCI (castling + EP from game state)."""
+    parts = []
+    for i in range(8):
+        empty = 0
+        row_s = []
+        for j in range(8):
+            p = board[i][j]
+            if not p:
+                empty += 1
+            else:
+                if empty:
+                    row_s.append(str(empty))
+                    empty = 0
+                ch = p[1]
+                if ch == "N":
+                    c = "N"
+                elif ch == "B":
+                    c = "B"
+                elif ch == "R":
+                    c = "R"
+                elif ch == "Q":
+                    c = "Q"
+                elif ch == "K":
+                    c = "K"
+                else:
+                    c = "P"
+                row_s.append(c.upper() if p[0] == "W" else c.lower())
+        if empty:
+            row_s.append(str(empty))
+        parts.append("".join(row_s))
+    placement = "/".join(parts)
+    stm = "w" if side_to_move == "W" else "b"
+    castling = ""
+    if not has_moved_ref.get("WK", True) and board[7][4] == "WK":
+        if not has_moved_ref.get("WR2", True) and board[7][7] in ("WR2",):
+            castling += "K"
+        if not has_moved_ref.get("WR1", True) and board[7][0] in ("WR1",):
+            castling += "Q"
+    if not has_moved_ref.get("BK", True) and board[0][4] == "BK":
+        if not has_moved_ref.get("BR2", True) and board[0][7] in ("BR2",):
+            castling += "k"
+        if not has_moved_ref.get("BR1", True) and board[0][0] in ("BR1",):
+            castling += "q"
+    if not castling:
+        castling = "-"
+    ep = "-"
+    if last_move:
+        ls, le = last_move
+        lp = board[le[0]][le[1]]
+        if lp and lp[1] == "P" and abs(ls[0] - le[0]) == 2:
+            f = string.ascii_lowercase[le[1]]
+            r = 8 - ((ls[0] + le[0]) // 2)
+            ep = f"{f}{r}"
+    halfm = 0
+    fullm = 1
+    return f"{placement} {stm} {castling} {ep} {halfm} {fullm}"
+
+
+def try_stockfish_move(board, depth, color, last_move):
+    exe = _stockfish_path()
+    if not exe or os.environ.get("CHESS_USE_STOCKFISH", "").lower() not in ("1", "true", "yes"):
+        return None
+    try:
+        fen = board_to_fen(board, color, last_move, has_moved)
+        proc = subprocess.Popen(
+            [exe],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        proc.stdin.write(f"uci\n")
+        proc.stdin.flush()
+        while True:
+            line = proc.stdout.readline()
+            if line.startswith("uciok"):
+                break
+        proc.stdin.write(f"position fen {fen}\n")
+        proc.stdin.write(f"go depth {max(1, depth)}\n")
+        proc.stdin.flush()
+        best = None
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            if line.startswith("bestmove"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] != "(none)":
+                    best = parts[1]
+                break
+        proc.stdin.write("quit\n")
+        proc.stdin.close()
+        proc.wait(timeout=3)
+        if not best or len(best) < 4:
+            return None
+        c0, r0, c1, r1 = best[0], int(best[1]), best[2], int(best[3])
+        sr = 8 - r0
+        sc = ord(c0) - ord("a")
+        er = 8 - r1
+        ec = ord(c1) - ord("a")
+        promo = None
+        if len(best) > 4:
+            promo = best[4].upper()
+        move = ((sr, sc), (er, ec))
+        if promo and promo in "QRBN":
+            pcolor = board[sr][sc][0] if board[sr][sc] else color
+            board_after = simulate_move(board, move, real_board=False)
+            return evaluate_board_positions_optimized(board_after), [move]
+        return evaluate_board_positions_optimized(simulate_move(board, move, real_board=False)), [move]
+    except (subprocess.SubprocessError, OSError, ValueError, IndexError) as e:
+        print(f"Stockfish UCI unavailable: {e}")
+        return None
 
 
 def draw_board(screen):
@@ -1406,7 +1937,8 @@ def initialize_game():
     # Initial game state setup
     global setauto_switch_colors_for_player, depth_formula,transposition_table, depth_equation,discount,player_turn, selected_piece, actual_last_move, \
         list_of_boards, move_number, end_of_game, running, show_simulation, board, depth, player,ai, evaluate_board, evaluation_method, \
-            select_best_ai_move, ai_method, has_moved, auto_save, game_history, game_history_simple, position_history, board_reversed, sound_enabled, has_moved_history
+            select_best_ai_move, ai_method, ai_method_white, ai_method_black, has_moved, auto_save, game_history, game_history_simple, position_history, board_reversed, sound_enabled, has_moved_history, \
+            llm_picker_for, llm_picker_page, llm_picker_paths
     # The initial board setup, simplified without pawn promotion
     board = initial_board
     player_turn = True
@@ -1427,6 +1959,9 @@ def initialize_game():
     player_turn = True
     setauto_switch_colors_for_player = False
     auto_save = False
+    llm_picker_for = None
+    llm_picker_page = 0
+    llm_picker_paths = []
 
     # PRESERVE AI method settings - DO NOT reset if LLM models are loaded
     # Only reset to default if no LLM is loaded
@@ -1459,7 +1994,10 @@ def initialize_game():
     draw_pieces_not_on_board(screen,board, height=SCREEN_HEIGHT)
     pygame.display.set_caption("JMR's Game of Chess")
     pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 200, SCREEN_WIDTH - 50,200))
-    screen.blit(font_info.render(f"Move: {move_number}. Player: {player}.  Ai: {ai_method}. {depth_equation}", True, BLACK), (27, SCREEN_HEIGHT - 150))
+    screen.blit(font_info.render(
+        f"Move: {move_number}. Player: {player}.  W: {friendly_ai_method_display(ai_method_white)}  "
+        f"B: {friendly_ai_method_display(ai_method_black)}.  {depth_equation}",
+        True, BLACK), (27, SCREEN_HEIGHT - 150))
     screen.blit(font_info.render(f"Depth: {depth}. Evaluation Method {evaluation_method}. Show simulation: {show_simulation}", True, BLACK), (27, SCREEN_HEIGHT - 125))
     pygame.display.flip()
 
@@ -1495,31 +2033,28 @@ depth_equations = {
 
 def help():
     # Display condensed help in bottom status area (like move messages)
-    pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 200, SCREEN_WIDTH - 50, 200))
+    help_h = 248
+    pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - help_h, SCREEN_WIDTH - 50, help_h))
 
     # Use smaller font for help
     small_font = pygame.font.SysFont("Arial", 18)
-    y = SCREEN_HEIGHT - 200  # Move up 30 pixels
+    y = SCREEN_HEIGHT - help_h
 
     screen.blit(small_font.render("Mouse: Click piece then destination to move", True, BLACK), (27, y))
     y += 16
-    screen.blit(small_font.render("s: save, l: load, r: restart", True, BLACK), (27, y))
+    screen.blit(small_font.render("s: save, l: load game file, r: restart", True, BLACK), (27, y))
     y += 16
-    screen.blit(small_font.render("x: switch player side", True, BLACK), (27, y))
+    screen.blit(small_font.render("x: play as White or Black (human vs AI); v: self-play (both AI)", True, BLACK), (27, y))
     y += 16
-    screen.blit(small_font.render("y: toggle AI thinking display", True, BLACK), (27, y))
+    screen.blit(small_font.render("y: toggle AI thinking display; Up/Down: search depth (Search engine only)", True, BLACK), (27, y))
     y += 16
-    screen.blit(small_font.render("Up/Down: change AI depth (3=default)", True, BLACK), (27, y))
+    screen.blit(small_font.render("a / z: cycle White / Black engine: Search (minimax) vs Neural (transformer)", True, BLACK), (27, y))
     y += 16
-    screen.blit(small_font.render("a: cycle WHITE AI, z: cycle BLACK AI", True, BLACK), (27, y))
+    screen.blit(small_font.render("W: load Neural .pth for White;  B: load Neural .pth for Black", True, BLACK), (27, y))
     y += 16
-    screen.blit(small_font.render("m: reload LLM for non-playing side", True, BLACK), (27, y))
+    screen.blit(small_font.render("Checkpoints: *.pth in Chess_LLM_models/ folder (or set CHESS_LLM_DIR env var)", True, BLACK), (27, y))
     y += 16
-    screen.blit(small_font.render("v: toggle self-play (AI vs AI)", True, BLACK), (27, y))
-    y += 16
-    screen.blit(small_font.render("Left/Right: review move history", True, BLACK), (27, y))
-    y += 16
-    screen.blit(small_font.render("d: cycle depth equations", True, BLACK), (27, y))
+    screen.blit(small_font.render("f: flip board; Left/Right: review move history; d: depth equations", True, BLACK), (27, y))
     y += 16
     screen.blit(small_font.render("Press any key to exit help", True, BLACK), (27, y))
 
@@ -1618,6 +2153,24 @@ while running:
             running = False
         if event.type == pygame.KEYDOWN:
 
+            # Neural checkpoint picker uses pygame only (tkinter + SDL crashes on macOS)
+            if llm_picker_for is not None:
+                handle_llm_picker_keydown(event)
+                pygame.time.wait(100)
+                draw_board_wrapper(screen, board)
+                draw_pieces_not_on_board(screen, board, height=SCREEN_HEIGHT)
+                pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 150, SCREEN_WIDTH - 50, 50))
+                screen.blit(font_info.render(
+                    f"Move: {move_number}. Player: {player}.  W: {friendly_ai_method_display(ai_method_white)}  "
+                    f"B: {friendly_ai_method_display(ai_method_black)}.  {depth_equation}",
+                    True, BLACK), (27, SCREEN_HEIGHT - 150))
+                screen.blit(font_info.render(
+                    f"Depth: {depth}. Evaluation: {evaluation_method}. Simulation: {'On' if show_simulation else 'Off'}",
+                    True, BLACK), (27, SCREEN_HEIGHT - 125))
+                draw_llm_picker_overlay(screen)
+                pygame.display.flip()
+                continue
+
             if event.key == pygame.K_UP:
                 if depth < 21:
                     depth += 1
@@ -1695,68 +2248,18 @@ while running:
                         end_of_game = False
 
 
-             #chaning AI method, moving through the dictionary, each time you press the key a key
+            # Engine per side: a = White, z = Black (Search = minimax, Neural = transformer .pth)
             if event.key == pygame.K_a:
-                # Cycle AI for current player
-                keys = list(ai_methods.keys())
-                if player == "W":
-                    index = keys.index(ai_method_white)
-                    if index < len(keys) - 1:
-                        index += 1
-                    else:
-                        index = 0
-                    ai_method_white = keys[index]
-                    print(f"White AI method is now {ai_method_white}.")
-                    # Initialize LLM if switched to LLM mode
-                    if ai_method_white == "LLM" and llm_white is None:
-                        print("Initializing LLM for White...")
-                        initialize_ai_model('W')
-                else:
-                    index = keys.index(ai_method_black)
-                    if index < len(keys) - 1:
-                        index += 1
-                    else:
-                        index = 0
-                    ai_method_black = keys[index]
-                    print(f"Black AI method is now {ai_method_black}.")
-                    # Initialize LLM if switched to LLM mode
-                    if ai_method_black == "LLM" and llm_black is None:
-                        print("Initializing LLM for Black...")
-                        initialize_ai_model('B')
+                cycle_ai_method_for_side("W")
 
             if event.key == pygame.K_z:
-                # Cycle AI for opponent
-                keys = list(ai_methods.keys())
-                if player == "W":
-                    index = keys.index(ai_method_black)
-                    if index < len(keys) - 1:
-                        index += 1
-                    else:
-                        index = 0
-                    ai_method_black = keys[index]
-                    print(f"Black AI method is now {ai_method_black}.")
-                    # Initialize LLM if switched to LLM mode
-                    if ai_method_black == "LLM" and llm_black is None:
-                        print("Initializing LLM for Black...")
-                        initialize_ai_model('B')
-                else:
-                    index = keys.index(ai_method_white)
-                    if index < len(keys) - 1:
-                        index += 1
-                    else:
-                        index = 0
-                    ai_method_white = keys[index]
-                    print(f"White AI method is now {ai_method_white}.")
-                    # Initialize LLM if switched to LLM mode
-                    if ai_method_white == "LLM" and llm_white is None:
-                        print("Initializing LLM for White...")
-                        initialize_ai_model('W')
+                cycle_ai_method_for_side("B")
 
-            if event.key == pygame.K_m:
-                #initialize LLM for the non-playing color
-                color = "B" if player == "W" else "W"
-                initialize_ai_model(color)
-                print(f"AI model reloaded for {color}.")
+            # Load Neural checkpoints: W = pick .pth for White, B = pick .pth for Black
+            if event.key == pygame.K_w:
+                start_llm_picker("W")
+            if event.key == pygame.K_b:
+                start_llm_picker("B")
 
             if event.key == pygame.K_n:  # 'n' for noise
                 sound_enabled = not sound_enabled
@@ -1867,7 +2370,7 @@ while running:
                 print(f"AI is now {piece_dict[ai]}.")
                 read_aloud(f"AI is now {piece_dict[ai]}.")
 
-            if event.key == pygame.K_b:  # 'b' for board reverse
+            if event.key == pygame.K_f:  # 'f' for flip / board reverse
                 board_reversed = not board_reversed
                 print(f"Board view reversed: {'Black' if board_reversed else 'White'} on bottom")
                 read_aloud(f"Board view reversed: {'Black' if board_reversed else 'White'} on bottom")  
@@ -1909,12 +2412,18 @@ while running:
             draw_board_wrapper(screen, board)
             draw_pieces_not_on_board(screen, board, height=SCREEN_HEIGHT)
             pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 150, SCREEN_WIDTH - 50,50))
-            screen.blit(font_info.render(f"Move: {move_number}. Player: {player}.  Ai white: {ai_method_white}. Ai black: {ai_method_black}. Depth equation: {depth_equation}", True, BLACK), (27, SCREEN_HEIGHT - 150))
+            screen.blit(font_info.render(
+                f"Move: {move_number}. Player: {player}.  W: {friendly_ai_method_display(ai_method_white)}  "
+                f"B: {friendly_ai_method_display(ai_method_black)}.  {depth_equation}",
+                True, BLACK), (27, SCREEN_HEIGHT - 150))
             screen.blit(font_info.render(f"Depth: {depth}. Evaluation: {evaluation_method}. Simulation: {'On' if show_simulation else 'Off'}", True, BLACK), (27, SCREEN_HEIGHT - 125))
+            draw_llm_picker_overlay(screen)
 
             pygame.display.flip()
          
         elif event.type == pygame.MOUSEBUTTONDOWN:
+            if llm_picker_for is not None:
+                continue
             if player_turn and not end_of_game:
                 moves = get_all_legal_moves(board, player, last_move = actual_last_move)
                 if moves:
@@ -2066,10 +2575,13 @@ while running:
             ai_method = ai_method_black if player == "W" else ai_method_white
 
         # ai_method is already set above for self-play
-        print(f"AI {piece_dict[ai]} {ai_method} is thinking...")
+        print(f"AI {piece_dict[ai]} {friendly_ai_method_display(ai_method)} is thinking...")
         pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 200, SCREEN_WIDTH - 50,100))
-        screen.blit(font.render(f"AI {piece_dict[ai]} {ai_method} is thinking...", True, BLACK), (27, SCREEN_HEIGHT - 200)) 
-        screen.blit(font_info.render(f"Move: {move_number}. Player: {player}.  Ai white: {ai_method_white}. Ai black: {ai_method_black}. Depth equation: {depth_equation}", True, BLACK), (27, SCREEN_HEIGHT - 150))
+        screen.blit(font.render(f"AI {piece_dict[ai]} {friendly_ai_method_display(ai_method)} is thinking...", True, BLACK), (27, SCREEN_HEIGHT - 200))
+        screen.blit(font_info.render(
+            f"Move: {move_number}. Player: {player}.  W: {friendly_ai_method_display(ai_method_white)}  "
+            f"B: {friendly_ai_method_display(ai_method_black)}.  {depth_equation}",
+            True, BLACK), (27, SCREEN_HEIGHT - 150))
         screen.blit(font_info.render(f"Depth: {depth}. Evaluation: {evaluation_method}. Simulation: {'On' if show_simulation else 'Off'}", True, BLACK), (27, SCREEN_HEIGHT - 125))
         pygame.display.flip()
         # Clear transposition table between moves to prevent accumulation of irrelevant positions

@@ -1,6 +1,8 @@
 # Chess AI — Learn Chess from Move Sequences
 
-A transformer that learns to play chess by reading raw move sequences. No chess engine, no search tree, no handcrafted rules — just a language model trained on millions of Stockfish games.
+A transformer that learns to play chess by reading raw move sequences. Training uses **no chess engine, no search tree, no handcrafted rules** — only next-move prediction on millions of Stockfish games.
+
+The **Pygame client** (`Chess_4_8_26.py`) adds a separate **classical CPU search** (alpha-beta, transposition table, quiescence). That search does **not** call the neural net. You can play with **Search** on one side and **Neural** (transformer) on the other, or any mix.
 
 ## How It Works
 
@@ -51,25 +53,35 @@ See [README_CHESS_PER_GAME.md](README_CHESS_PER_GAME.md) for detailed documentat
 
 ## Project Files
 
-| File | Purpose |
-|------|---------|
-| `Chess_Brain_WB_2_12_26.py` | Model training (multi-GPU, both modes) |
-| `Chess_Inference_WB_2_12_26.py` | Model inference (auto-detects mode from checkpoint) |
-| `Chess_WB_2_12_26.py` | Interactive chess game (Pygame GUI) |
+| File / location | Purpose |
+|-----------------|---------|
+| `Chess_Brain_3_21_26.py` | Model training (multi-GPU, both token modes) |
+| `Chess_Inference.py` | Neural inference (auto-detects classic vs 4-token from checkpoint) |
+| `Chess_4_8_26.py` | Pygame GUI: human / **Search** (CPU) / **Neural** (LLM) per side |
+| `Chess_LLM_models/` | **Local** folder for `*.pth` checkpoints (directory tracked; weight files not in git) |
 | `plot_loss_March_20_26.py` | Training loss visualization |
-| `combine_chess_datasets.py` | Combine game files for training |
+| `chess_requirement.txt` | Python dependencies for this repo |
+| `OLD chess brains/` | Archived older training / data scripts (superseded filenames, kept for reference) |
+
+## `Chess_LLM_models/` (checkpoints)
+
+Clone the repo, then **copy** your `.pth` files into `Chess_LLM_models/` (or set env `CHESS_LLM_DIR` to another folder). Git **does not** store those weights; only the empty folder placeholder is committed so everyone has the same path.
+
+## `OLD chess brains/`
+
+Older copies of dataset/training utilities (e.g. per-game torchcompile brain, parquet converter, combine script) live here for reference. Active training is expected to use `Chess_Brain_3_21_26.py` and the current inference/game files above.
 
 ## Training
 
 ### Data
 - **Source**: Stockfish self-play games
 - **Format**: Parquet files with `Moves` (list of UCI strings) and `Result` columns, or plain text (one game per paragraph)
-- **Loading**: Parquet files are read directly — the converter script (`parquettorext_withpromotion_Dec_12.py`) is no longer needed
+- **Loading**: Parquet files are read directly in the training script
 
 ### Quick Start
 ```bash
 pip install -r chess_requirement.txt
-python Chess_Brain_WB_2_12_26.py
+python Chess_Brain_3_21_26.py
 ```
 
 At startup, choose:
@@ -82,13 +94,15 @@ Training supports Ctrl+C to pause and change learning rate or load new data with
 ### Hardware
 Tested on 4x NVIDIA RTX 6000 Ada (48GB each). Automatic batch size estimation based on actual free GPU memory.
 
-## Playing
+## Playing (GUI)
 
 ```bash
-python Chess_WB_2_12_26.py
+python Chess_4_8_26.py
 ```
 
-Load a checkpoint for white, black, or both. The GUI auto-detects the checkpoint mode (classic or 4-token) and plays accordingly. Both modes return standard UCI moves — the game engine validates legality and picks the best legal suggestion.
+Use **a** / **z** to cycle each side between **Search** (classical minimax) and **Neural** (transformer). **W** / **B** pick a `.pth` for that side. The GUI validates moves with its chess rules; the neural path suggests UCI strings and Search uses its own eval.
+
+Optional: `CHESS_USE_STOCKFISH=1` (and `CHESS_STOCKFISH` path) can delegate **Search** to Stockfish if installed — see `Chess_4_8_26.py` for UCI integration.
 
 ## Author
 

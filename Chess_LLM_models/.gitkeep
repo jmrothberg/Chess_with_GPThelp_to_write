@@ -1,0 +1,2 @@
+# Put transformer checkpoints (*.pth) here for the Pygame client.
+# This folder is in git; large weight files are ignored — copy them locally.

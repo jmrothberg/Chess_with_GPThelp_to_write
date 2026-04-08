@@ -12,5 +12,8 @@ torchaudio>=2.4.0
 # Required - Adafactor optimizer
 transformers>=4.40.0
 
+# Pygame GUI — Chess_WB_2_12_26.py, game_selector3D.py
+pygame>=2.5.0
+
 # System packages (not pip installable):
 # - tkinter: sudo apt install python3-tk (Linux) or comes with Python (Mac/Windows)
