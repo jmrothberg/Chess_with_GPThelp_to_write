@@ -51,6 +51,10 @@ Both modes default to the same game coverage (~64 full moves of context).
 
 See [README_CHESS_PER_GAME.md](README_CHESS_PER_GAME.md) for detailed documentation of both modes, the per-game training strategy, and parquet format details.
 
+## Keeping this repo current (preferred)
+
+The canonical tree lives on GitHub (`main`). **Preferred:** from your clone root, run `git pull origin main` whenever you want the latest training, inference, and GUI scripts. That keeps filenames and behavior aligned with [Chess_with_GPThelp_to_write](https://github.com/jmrothberg/Chess_with_GPThelp_to_write). Commit or stash local edits first if `git pull` reports conflicts.
+
 ## Project Files
 
 | File / location | Purpose |

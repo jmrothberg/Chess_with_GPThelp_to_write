@@ -272,7 +272,7 @@ def main():
     if platform.system() == "Darwin":
         default_start_dir = "/Users/jonathanrothberg/Data"
     else:
-        default_start_dir = "/home/jonathan/Data"
+        default_start_dir = "/data/Data"
 
     # Command line argument specifies starting directory for interactive selection
     start_dir = sys.argv[1] if len(sys.argv) == 2 else default_start_dir

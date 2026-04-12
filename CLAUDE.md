@@ -9,20 +9,23 @@ A transformer-based language model that learns to play chess by reading raw move
 ## Commands
 
 ```bash
+# Stay current with upstream (preferred before large work sessions)
+git pull origin main
+
 # Install dependencies
 pip install -r chess_requirement.txt
 
 # Train a model (interactive prompts for mode, data, GPUs)
-python Chess_Brain_WB_2_12_26.py
+python Chess_Brain_3_21_26.py
 
-# Play chess via Pygame GUI
-python Chess_WB_2_12_26.py
+# Play chess via Pygame GUI (human / CPU Search / Neural per side)
+python Chess_4_8_26.py
 
 # Plot training loss from checkpoint filenames
 python plot_loss_March_20_26.py [checkpoint_folder]
 
-# Combine .txt game files into larger training sets
-python combine_chess_datasets.py <group_size> <input_dir> <output_dir>
+# Combine .txt game files (archived copy under OLD chess brains/)
+python "OLD chess brains/combine_chess_datasets.py" <group_size> <input_dir> <output_dir>
 ```
 
 There is no test suite. Validation is done through GUI play, move legality tracking, and loss curves.
@@ -31,9 +34,11 @@ There is no test suite. Validation is done through GUI play, move legality track
 
 ### Three Main Files
 
-- **`Chess_Brain_WB_2_12_26.py`** (~3,200 lines) — Training script. Contains the model definition, both dataset classes, data loading, and the full training loop with multi-GPU support.
-- **`Chess_Inference_WB_2_12_26.py`** (~1,100 lines) — Inference engine. Auto-detects checkpoint mode (classic vs 4-token) and provides `generate_response()` for move generation.
-- **`Chess_WB_2_12_26.py`** (~2,200 lines) — Pygame GUI. Imports inference module as `brain_inference`. Supports Human, minimax AI, and LLM-based play.
+- **`Chess_Brain_3_21_26.py`** — Training script. Model definition, both dataset classes, data loading, full training loop with multi-GPU support.
+- **`Chess_Inference.py`** — Inference engine. Auto-detects checkpoint mode (classic vs 4-token) and provides `generate_response()` for move generation.
+- **`Chess_4_8_26.py`** — Pygame GUI. Imports `Chess_Inference` as `brain_inference`. Human play, classical CPU **Search** (alpha-beta; optional Stockfish), and **Neural** (LLM) per side.
+
+Older dated copies of training/data utilities live under **`OLD chess brains/`** for reference only.
 
 ### Two Tokenization Modes (selected at training startup)
 
