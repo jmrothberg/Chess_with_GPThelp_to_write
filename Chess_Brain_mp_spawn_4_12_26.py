@@ -2504,9 +2504,21 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
                                 block_size, token_mode, move_to_idx
                             )
                             del new_data
+
+                            # Wait for ALL ranks to finish loading before rank 0 deletes the file
+                            dist.barrier()
                             if rank == 0:
                                 os.remove(_tmp_path)
                                 print(f"New dataset: {len(dataset)} sequences. Restarting from epoch 1.\n")
+
+                            # Also apply LR change if user entered one before selecting 'd'
+                            new_lr = lr_tensor[0].item()
+                            if new_lr > 0:
+                                for pg in optimizer.param_groups:
+                                    pg['lr'] = new_lr
+                                if rank == 0:
+                                    print(f"Learning rate updated to {new_lr:.2e} on all {world_size} GPUs")
+
                             _new_data = True
                             _batch_interrupted = True
                             break
