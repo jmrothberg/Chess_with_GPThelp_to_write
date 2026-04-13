@@ -2318,6 +2318,7 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
 
             _batch_interrupted = False
             _quit_training = False
+            _new_data = False
 
             for batch_idx, (x, y, y_roles) in enumerate(data_loader):
                 if epoch == start_epoch and batch_idx < start_batch:
@@ -2406,14 +2407,14 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
 
                 if interrupt_tensor[0] == 1:
                     # Only rank 0 shows the interactive menu.
-                    # Ranks 1-3 block at the broadcast below, waiting for rank 0's decision.
+                    # Ranks 1-3 block at the broadcasts below, waiting for rank 0's decision.
+                    # Actions: 0=quit, 1=LR change, 2=no change, 3=new data
                     action_tensor = torch.zeros(1, dtype=torch.long, device=rank)
                     lr_tensor = torch.zeros(1, dtype=torch.float64, device=rank)
 
                     if rank == 0:
                         current_lr = optimizer.param_groups[0]['lr']
                         print(f"\nCurrent learning rate: {current_lr:.2e}")
-                        print("Options: enter new LR, then q=quit or Enter=continue")
                         try:
                             lr_input = input("New learning rate (or Enter to keep current): ").strip()
                             if lr_input:
@@ -2425,14 +2426,15 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
                                 except ValueError:
                                     print("Invalid LR, keeping current.")
 
-                            choice = input("Quit training? (q=quit, Enter=continue): ").strip().lower()
+                            choice = input("Load new data / Quit / Continue? (d=new data, q=quit, Enter=continue): ").strip().lower()
                             if choice == 'q':
-                                action_tensor[0] = 0  # quit overrides LR change
-                                lr_tensor[0] = 0  # clear LR since we're quitting
+                                action_tensor[0] = 0
+                            elif choice == 'd':
+                                action_tensor[0] = 3  # new data
                             elif action_tensor[0] != 1:
                                 action_tensor[0] = 2  # no change
                         except (KeyboardInterrupt, EOFError):
-                            action_tensor[0] = 0  # quit
+                            action_tensor[0] = 0
 
                     dist.broadcast(action_tensor, src=0)
                     dist.broadcast(lr_tensor, src=0)
@@ -2440,7 +2442,6 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
 
                     if action == 0:
                         if rank == 0:
-                            # Save before quitting
                             avg_loss = running_loss / max(total_batches, 1)
                             save_model_all(
                                 model.module, all_text, n_embd, n_head, n_kv_heads, n_layer, dropout,
@@ -2455,10 +2456,61 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
                         for pg in optimizer.param_groups:
                             pg['lr'] = new_lr
                         if rank == 0:
-                            print(f"Learning rate updated to {new_lr:.2e} on all {world_size} GPUs")
-                            print("To load new training data, quit and restart.\n")
+                            print(f"Learning rate updated to {new_lr:.2e} on all {world_size} GPUs\n")
                         _batch_interrupted = True
                         break
+                    elif action == 3:
+                        # New data: rank 0 loads + tokenizes, saves to temp file,
+                        # all ranks load from the same file (same machine = same filesystem).
+                        import tempfile
+                        _tmp_path = os.path.join(tempfile.gettempdir(), '_chess_ddp_new_data.pt')
+                        data_ready = torch.zeros(1, dtype=torch.long, device=rank)
+
+                        if rank == 0:
+                            print("\nSelect new training data file...")
+                            file_path = create_file_dialog(
+                                title="Select New Chess Games File",
+                                filetypes=[("Chess files", "*.txt *.parquet"), ("Text files", "*.txt"), ("Parquet files", "*.parquet")])
+                            if file_path:
+                                if file_path.lower().endswith('.parquet'):
+                                    new_text = _read_parquet_as_text(file_path)
+                                else:
+                                    with open(file_path, 'r', encoding='utf-8') as f:
+                                        new_text = f.read()
+                                games = new_text.split('\n\n')
+                                games = ['<STARTGAME> ' + g.strip() + ' <EOFG>' for g in games if g.strip()]
+                                new_text = '\n'.join(games)
+                                print(f"Tokenizing new data ({len(games)} games)...")
+                                if token_mode == 'classic':
+                                    tmp_ds = ClassicChessMovesDataset(new_text, block_size, move_to_idx)
+                                    torch.save({'tokens': tmp_ds.tokens_tensor, 'roles': None}, _tmp_path)
+                                else:
+                                    tmp_ds = ChessMovesDataset(new_text, block_size, move_to_idx)
+                                    torch.save({'tokens': tmp_ds.tokens_tensor, 'roles': tmp_ds.roles_tensor}, _tmp_path)
+                                del tmp_ds, new_text
+                                data_ready[0] = 1
+                                print(f"New data ready for all GPUs.")
+                            else:
+                                print("No file selected. Continuing training...")
+
+                        # Broadcast whether data was actually loaded (user might cancel dialog)
+                        dist.broadcast(data_ready, src=0)
+
+                        if data_ready[0] == 1:
+                            # All ranks load from the same temp file
+                            new_data = torch.load(_tmp_path, map_location='cpu', weights_only=True)
+                            dataset = _PreTokenizedDataset(
+                                new_data['tokens'], new_data.get('roles'),
+                                block_size, token_mode, move_to_idx
+                            )
+                            del new_data
+                            if rank == 0:
+                                os.remove(_tmp_path)
+                                print(f"New dataset: {len(dataset)} sequences. Restarting from epoch 1.\n")
+                            _new_data = True
+                            _batch_interrupted = True
+                            break
+                        # else: user cancelled, continue training
                     # action == 2: no change, continue
                     if rank == 0:
                         print("No changes. Continuing training...\n")
@@ -2469,6 +2521,14 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
             if _batch_interrupted:
                 if _quit_training:
                     break
+                elif _new_data:
+                    epoch = 0
+                    start_epoch = 0
+                    start_batch = 0
+                    epoch_losses = []
+                    running_loss = 0.0
+                    total_batches = 0
+                    continue
                 else:
                     continue
 
