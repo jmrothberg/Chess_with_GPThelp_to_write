@@ -2772,14 +2772,22 @@ def _train_chess_model_core(text, checkpoint_data=None, token_mode='4token'):
         # parasitic context per process on GPU 0)
         os.environ['_CHESS_DDP_WORKER'] = '1'
 
-        mp.spawn(
-            _ddp_train_worker,
-            args=(world_size, gpu_indices, train_args),
-            nprocs=world_size,
-            join=True
-        )
+        # Main process SIGINT handler: IGNORE Ctrl+C so it doesn't die.
+        # Ctrl+C still reaches rank 0 worker (which has its own handler).
+        # Without this, main process raises KeyboardInterrupt in mp.spawn.join(),
+        # which disrupts rank 0's stdin and breaks the interactive Ctrl+C menu.
+        _main_old_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-        os.environ.pop('_CHESS_DDP_WORKER', None)
+        try:
+            mp.spawn(
+                _ddp_train_worker,
+                args=(world_size, gpu_indices, train_args),
+                nprocs=world_size,
+                join=True
+            )
+        finally:
+            signal.signal(signal.SIGINT, _main_old_sigint)
+            os.environ.pop('_CHESS_DDP_WORKER', None)
     else:
         # Single GPU — train directly without DDP overhead
         print(f"\nSingle GPU training on GPU {gpu_indices[0]}")
