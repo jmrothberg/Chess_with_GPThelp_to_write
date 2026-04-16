@@ -2414,25 +2414,31 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
 
                     if rank == 0:
                         current_lr = optimizer.param_groups[0]['lr']
-                        print(f"\nCurrent learning rate: {current_lr:.2e}")
+                        print(f"\n{'='*50}")
+                        print(f"Training paused! Current LR: {current_lr:.2e}")
+                        print(f"  Enter    = continue training")
+                        print(f"  number   = change learning rate (e.g. 1e-4)")
+                        print(f"  d        = load new training data")
+                        print(f"  q        = quit (saves checkpoint first)")
+                        print(f"{'='*50}")
                         try:
-                            lr_input = input("New learning rate (or Enter to keep current): ").strip()
-                            if lr_input:
-                                try:
-                                    new_lr_val = float(lr_input)
-                                    lr_tensor[0] = new_lr_val
-                                    action_tensor[0] = 1  # LR change
-                                    print(f"Learning rate will change to: {new_lr_val:.2e}")
-                                except ValueError:
-                                    print("Invalid LR, keeping current.")
-
-                            choice = input("Load new data / Quit / Continue? (d=new data, q=quit, Enter=continue): ").strip().lower()
+                            sys.stdout.flush()
+                            choice = input("Choice: ").strip().lower()
                             if choice == 'q':
                                 action_tensor[0] = 0
                             elif choice == 'd':
-                                action_tensor[0] = 3  # new data
-                            elif action_tensor[0] != 1:
-                                action_tensor[0] = 2  # no change
+                                action_tensor[0] = 3
+                            elif choice == '':
+                                action_tensor[0] = 2  # continue
+                            else:
+                                try:
+                                    new_lr_val = float(choice)
+                                    lr_tensor[0] = new_lr_val
+                                    action_tensor[0] = 1
+                                    print(f"Learning rate will change to: {new_lr_val:.2e}")
+                                except ValueError:
+                                    print(f"Unknown input '{choice}', continuing...")
+                                    action_tensor[0] = 2
                         except (KeyboardInterrupt, EOFError):
                             action_tensor[0] = 0
 
