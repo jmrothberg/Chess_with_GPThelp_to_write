@@ -2421,26 +2421,27 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
                         print(f"  d        = load new training data")
                         print(f"  q        = quit (saves checkpoint first)")
                         print(f"{'='*50}")
+                        sys.stdout.flush()
                         try:
-                            sys.stdout.flush()
                             choice = input("Choice: ").strip().lower()
-                            if choice == 'q':
-                                action_tensor[0] = 0
-                            elif choice == 'd':
-                                action_tensor[0] = 3
-                            elif choice == '':
-                                action_tensor[0] = 2  # continue
-                            else:
-                                try:
-                                    new_lr_val = float(choice)
-                                    lr_tensor[0] = new_lr_val
-                                    action_tensor[0] = 1
-                                    print(f"Learning rate will change to: {new_lr_val:.2e}")
-                                except ValueError:
-                                    print(f"Unknown input '{choice}', continuing...")
-                                    action_tensor[0] = 2
                         except (KeyboardInterrupt, EOFError):
+                            print("Input error — continuing training (type q to quit)...")
+                            choice = ''
+                        if choice == 'q':
                             action_tensor[0] = 0
+                        elif choice == 'd':
+                            action_tensor[0] = 3
+                        elif choice == '':
+                            action_tensor[0] = 2  # continue
+                        else:
+                            try:
+                                new_lr_val = float(choice)
+                                lr_tensor[0] = new_lr_val
+                                action_tensor[0] = 1
+                                print(f"Learning rate will change to: {new_lr_val:.2e}")
+                            except ValueError:
+                                print(f"Unknown input '{choice}', continuing...")
+                                action_tensor[0] = 2
 
                     dist.broadcast(action_tensor, src=0)
                     dist.broadcast(lr_tensor, src=0)
