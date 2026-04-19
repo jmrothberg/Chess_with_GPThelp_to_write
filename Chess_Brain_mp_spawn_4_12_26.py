@@ -2148,6 +2148,13 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
                 _interrupt_requested[0] = True
                 print("\n\nCtrl+C detected! Will pause after current batch...")
             _old_sigint = signal.signal(signal.SIGINT, _sigint_handler)
+
+            # Python's multiprocessing closes stdin and replaces it with /dev/null
+            # in spawned child processes. Reopen from the terminal so input() works.
+            try:
+                sys.stdin = open('/dev/tty', 'r')
+            except OSError:
+                pass  # No terminal (e.g. running in a script) — input() will still fail gracefully
         else:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
 
