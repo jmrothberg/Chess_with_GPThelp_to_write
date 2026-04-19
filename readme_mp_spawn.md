@@ -194,6 +194,43 @@ model = MyModel(...)  # All ranks get identical random weights
 ```
 For checkpoint resume this is harmless (load_state_dict overwrites the random init).
 
+### 9. Spawned workers have stdin replaced with /dev/null
+
+**Symptom:** `input()` in rank 0 worker immediately returns EOFError. Interactive Ctrl+C menu is unusable — training quits or continues without waiting for user input.
+
+**Cause:** Python's `multiprocessing.util._close_stdin()` is called during child process bootstrap. It closes the real stdin and replaces `sys.stdin` with `/dev/null`. This is by design to prevent multiple processes from competing for terminal input. But it breaks any interactive prompt in the worker.
+
+**Fix:** Rank 0 reopens stdin from the terminal at worker startup:
+```python
+if rank == 0:
+    try:
+        sys.stdin = open('/dev/tty', 'r')
+    except OSError:
+        pass  # No terminal available (headless/script mode)
+```
+Only rank 0 needs this (other ranks never read input). Also make `input()` failure safe — default to "continue training" not "quit":
+```python
+try:
+    choice = input("Choice: ").strip()
+except (KeyboardInterrupt, EOFError):
+    choice = ''  # continue, don't quit
+```
+
+### 10. Main process must ignore SIGINT during mp.spawn
+
+**Symptom:** Ctrl+C kills main process (traceback in `mp.spawn.join()`), which orphans workers or breaks their stdin.
+
+**Cause:** Ctrl+C sends SIGINT to the entire process group. Workers have handlers, but the main process (sitting in `mp.spawn.join()`) has the default handler which raises `KeyboardInterrupt`.
+
+**Fix:**
+```python
+old_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+try:
+    mp.spawn(worker_fn, ...)
+finally:
+    signal.signal(signal.SIGINT, old_handler)
+```
+
 ### Summary checklist for adding DDP to any training script
 
 - [ ] All data passed to `mp.spawn` must be CPU tensors (no CUDA tensors)
@@ -201,6 +238,9 @@ For checkpoint resume this is harmless (load_state_dict overwrites the random in
 - [ ] Guard module-level CUDA init with env var to skip in workers
 - [ ] Tokenize/preprocess data ONCE before spawn, use `share_memory_()`
 - [ ] All ranks must handle SIGINT (rank 0 catches, others ignore)
+- [ ] Main process must ignore SIGINT during mp.spawn
+- [ ] Rank 0 must reopen stdin from `/dev/tty` for interactive input
+- [ ] `input()` failure must default to continue, not quit
 - [ ] Wrap worker in `try/finally` with cleanup
 - [ ] Use `PYTORCH_ALLOC_CONF` not `PYTORCH_CUDA_ALLOC_CONF`
 - [ ] Set fixed random seed before model init for fresh training
