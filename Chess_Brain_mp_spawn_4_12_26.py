@@ -2481,10 +2481,15 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
                         data_ready = torch.zeros(1, dtype=torch.long, device=rank)
 
                         if rank == 0:
-                            print("\nSelect new training data file...")
-                            file_path = create_file_dialog(
-                                title="Select New Chess Games File",
-                                filetypes=[("Chess files", "*.txt *.parquet"), ("Text files", "*.txt"), ("Parquet files", "*.parquet")])
+                            # Use text input instead of tkinter file dialog in DDP mode.
+                            # tkinter crashes with "fd_set out of range" when too many file
+                            # descriptors are open (DDP + DataLoader workers + NCCL > FD_SETSIZE).
+                            print("\nEnter path to new training data file (.txt or .parquet):")
+                            print("  (tip: drag and drop the file into the terminal)")
+                            try:
+                                file_path = input("File path: ").strip().strip("'\"")
+                            except (KeyboardInterrupt, EOFError):
+                                file_path = ""
                             if file_path:
                                 if file_path.lower().endswith('.parquet'):
                                     new_text = _read_parquet_as_text(file_path)
