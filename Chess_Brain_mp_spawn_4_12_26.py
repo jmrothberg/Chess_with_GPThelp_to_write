@@ -2481,11 +2481,13 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
                         _tmp_path = os.path.join(tempfile.gettempdir(), '_chess_ddp_new_data.pt')
                         _ready_path = _tmp_path + '.ready'
 
-                        # Clean up any stale marker from a previous attempt
+                        # Clean up any stale marker from a previous attempt.
+                        # All ranks must wait (barrier) so ranks 1-3 don't find a stale .ready
                         if rank == 0:
                             for p in [_tmp_path, _ready_path]:
                                 if os.path.exists(p):
                                     os.remove(p)
+                        dist.barrier()
 
                         _data_loaded = False
                         if rank == 0:
@@ -2513,6 +2515,8 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
                                     tmp_ds = ChessMovesDataset(new_text, block_size, move_to_idx)
                                     torch.save({'tokens': tmp_ds.tokens_tensor, 'roles': tmp_ds.roles_tensor}, _tmp_path)
                                 del tmp_ds, new_text
+                                # Ensure .pt file is fully written to disk before signaling
+                                os.sync()
                                 # Signal to other ranks that data is ready
                                 with open(_ready_path, 'w') as f:
                                     f.write('ready')
