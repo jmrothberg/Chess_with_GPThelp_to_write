@@ -2475,22 +2475,27 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
                         break
                     elif action == 3:
                         # New data: rank 0 loads + tokenizes, saves to temp file,
-                        # all ranks load from the same file (same machine = same filesystem).
-                        import tempfile
+                        # all ranks poll for the file (NO dist.broadcast during tokenization —
+                        # NCCL times out after 10 min and tokenization takes longer).
+                        import tempfile, time
                         _tmp_path = os.path.join(tempfile.gettempdir(), '_chess_ddp_new_data.pt')
-                        data_ready = torch.zeros(1, dtype=torch.long, device=rank)
+                        _ready_path = _tmp_path + '.ready'
 
+                        # Clean up any stale marker from a previous attempt
                         if rank == 0:
-                            # Use text input instead of tkinter file dialog in DDP mode.
-                            # tkinter crashes with "fd_set out of range" when too many file
-                            # descriptors are open (DDP + DataLoader workers + NCCL > FD_SETSIZE).
+                            for p in [_tmp_path, _ready_path]:
+                                if os.path.exists(p):
+                                    os.remove(p)
+
+                        _data_loaded = False
+                        if rank == 0:
                             print("\nEnter path to new training data file (.txt or .parquet):")
                             print("  (tip: drag and drop the file into the terminal)")
                             try:
                                 file_path = input("File path: ").strip().strip("'\"")
                             except (KeyboardInterrupt, EOFError):
                                 file_path = ""
-                            if file_path:
+                            if file_path and os.path.exists(file_path):
                                 if file_path.lower().endswith('.parquet'):
                                     new_text = _read_parquet_as_text(file_path)
                                 else:
@@ -2500,6 +2505,7 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
                                 games = ['<STARTGAME> ' + g.strip() + ' <EOFG>' for g in games if g.strip()]
                                 new_text = '\n'.join(games)
                                 print(f"Tokenizing new data ({len(games)} games)...")
+                                print(f"GPUs 1-3 will sleep until tokenization finishes.")
                                 if token_mode == 'classic':
                                     tmp_ds = ClassicChessMovesDataset(new_text, block_size, move_to_idx)
                                     torch.save({'tokens': tmp_ds.tokens_tensor, 'roles': None}, _tmp_path)
@@ -2507,16 +2513,34 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
                                     tmp_ds = ChessMovesDataset(new_text, block_size, move_to_idx)
                                     torch.save({'tokens': tmp_ds.tokens_tensor, 'roles': tmp_ds.roles_tensor}, _tmp_path)
                                 del tmp_ds, new_text
-                                data_ready[0] = 1
-                                print(f"New data ready for all GPUs.")
+                                # Signal to other ranks that data is ready
+                                with open(_ready_path, 'w') as f:
+                                    f.write('ready')
+                                print(f"New data saved. Signaling other GPUs...")
+                                _data_loaded = True
                             else:
-                                print("No file selected. Continuing training...")
+                                if file_path:
+                                    print(f"File not found: {file_path}")
+                                else:
+                                    print("No file entered.")
+                                print("Continuing training...")
+                                # Signal no-data so other ranks stop waiting
+                                with open(_ready_path, 'w') as f:
+                                    f.write('cancel')
+                        else:
+                            # Ranks 1-3: sleep-poll for the marker file (no NCCL, no GPU spin)
+                            while not os.path.exists(_ready_path):
+                                time.sleep(2)
 
-                        # Broadcast whether data was actually loaded (user might cancel dialog)
-                        dist.broadcast(data_ready, src=0)
+                        # All ranks check what happened
+                        if rank != 0:
+                            with open(_ready_path, 'r') as f:
+                                _data_loaded = (f.read().strip() == 'ready')
 
-                        if data_ready[0] == 1:
-                            # All ranks load from the same temp file
+                        if _data_loaded:
+                            # Small delay to ensure temp file write is fully flushed
+                            if rank != 0:
+                                time.sleep(1)
                             new_data = torch.load(_tmp_path, map_location='cpu', weights_only=True)
                             dataset = _PreTokenizedDataset(
                                 new_data['tokens'], new_data.get('roles'),
@@ -2524,13 +2548,13 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
                             )
                             del new_data
 
-                            # Wait for ALL ranks to finish loading before rank 0 deletes the file
+                            # Barrier to sync before cleanup (this one is fast — no tokenization)
                             dist.barrier()
                             if rank == 0:
                                 os.remove(_tmp_path)
+                                os.remove(_ready_path)
                                 print(f"New dataset: {len(dataset)} sequences. Restarting from epoch 1.\n")
 
-                            # Also apply LR change if user entered one before selecting 'd'
                             new_lr = lr_tensor[0].item()
                             if new_lr > 0:
                                 for pg in optimizer.param_groups:
@@ -2541,7 +2565,11 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
                             _new_data = True
                             _batch_interrupted = True
                             break
-                        # else: user cancelled, continue training
+                        else:
+                            # User cancelled — clean up marker, sync ranks, continue
+                            dist.barrier()
+                            if rank == 0 and os.path.exists(_ready_path):
+                                os.remove(_ready_path)
                     # action == 2: no change, continue
                     if rank == 0:
                         print("No changes. Continuing training...\n")
