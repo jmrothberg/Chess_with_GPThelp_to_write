@@ -1,0 +1,21 @@
+# Core PyTorch dependencies for GPU-accelerated chess AI
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# Hugging Face transformers for optimization
+transformers>=4.21.0
+
+# Scientific computing and visualization
+numpy>=1.21.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# Machine learning
+scikit-learn>=1.0.0
+
+# Game development (for chess visualization)
+pygame>=2.0.0
+
+# Standard library enhancements
+pathlib2>=2.3.0  # For Path compatibility
