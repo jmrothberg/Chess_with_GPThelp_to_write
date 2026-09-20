@@ -37,9 +37,11 @@ pygame.init()
 
 # Constants for the game
 SCREEN_WIDTH = 1200
-SCREEN_HEIGHT = 1400
+# Board is 8*150=1200 tall; extra strip below so help/status never cover pieces
+SCREEN_HEIGHT = 1540
 BOARD_SIZE = 8
 SQUARE_SIZE = SCREEN_WIDTH // BOARD_SIZE
+BOARD_PIXEL_H = BOARD_SIZE * SQUARE_SIZE  # top of the status/help strip
 GRAY = (128, 128, 128)
 BLACK = (0, 0, 0)
 WHITE = (255, 255, 255)
@@ -51,6 +53,9 @@ HIGHLIGHT_MOVE = (80, 180, 90)      # green: empty square, not under reply-captu
 HIGHLIGHT_TRADE = (240, 200, 40)    # yellow: under reply-capture, but you can take back
 HIGHLIGHT_CAPTURE = (220, 70, 70)   # red ring: safe capture of an enemy piece
 HIGHLIGHT_HANG = (220, 70, 70)      # red filled: under reply-capture and you cannot take back
+
+# c key toggles green/yellow/red move + threat dots (selection gold border stays)
+show_move_colors = True
 
 sound_enabled = True
 board_reversed = False
@@ -297,8 +302,15 @@ BOARD_ORIGIN = (SCREEN_WIDTH // 2, 200)  # Origin point for drawing the board
 def draw_board_wrapper(screen, board, selected=None, legal_ends=None):
     if display_mode == '2D':
         draw_board(screen)
-        draw_selection_hints(screen, board, selected, legal_ends)
+        # Gold select border always; colored dots only when show_move_colors
+        if selected:
+            draw_selection_hints(screen, board, selected, legal_ends if show_move_colors else None)
         draw_pieces(screen, board)
+        # After the other side moved: mark our pieces they can take (red/yellow)
+        if show_move_colors:
+            # vs AI: always your (player) pieces; self-play: side about to move
+            victim = ai if setauto_switch_colors_for_player else player
+            draw_opponent_capture_threats(screen, board, victim, last_move=actual_last_move)
     else:
         screen.fill(WHITE)
         draw_isometric_board(screen)
@@ -2209,7 +2221,8 @@ def draw_selection_hints(screen, board, selected, legal_ends):
     Green  = safe empty square (opponent cannot take you there next).
     Yellow = opponent can take you there, but you can take back.
     Red filled = opponent can take you there and you cannot take back.
-    Red ring = you capture an enemy piece and are not under reply-capture."""
+    Red ring = you capture an enemy piece and are not under reply-capture.
+    legal_ends=None → gold select only (colors toggled off with c)."""
     if not selected:
         return
     sr, sc = selected
@@ -2246,6 +2259,34 @@ def draw_selection_hints(screen, board, selected, legal_ends):
             pygame.draw.circle(screen, HIGHLIGHT_CAPTURE, (cx, cy), SQUARE_SIZE // 2 - 8, 5)
         else:
             pygame.draw.circle(screen, HIGHLIGHT_MOVE, (cx, cy), r_dot)
+
+
+def draw_opponent_capture_threats(screen, board, victim_color, last_move=None):
+    """After the other side moved: mark our pieces they can take.
+    Yellow = we can take back; red = we cannot. Drawn on top of pieces."""
+    if not victim_color:
+        return
+    attacker = "B" if victim_color == "W" else "W"
+    opp_moves = get_all_legal_moves(board, attacker, last_move=last_move, check_legality=True)
+    seen = set()
+    r_dot = max(10, SQUARE_SIZE // 8)
+    for start, end in opp_moves:
+        er, ec = end
+        if (er, ec) in seen:
+            continue
+        victim = board[er][ec]
+        if not (victim and victim[0] == victim_color):
+            continue
+        seen.add((er, ec))
+        # Simulate their capture; can we retake on that square?
+        after = simulate_move(board, (start, end))
+        can_retake = is_square_under_attack(after, er, ec, victim_color)
+        dr = BOARD_SIZE - 1 - er if board_reversed else er
+        dc = BOARD_SIZE - 1 - ec if board_reversed else ec
+        cx = dc * SQUARE_SIZE + SQUARE_SIZE // 2
+        cy = dr * SQUARE_SIZE + SQUARE_SIZE // 2
+        color = HIGHLIGHT_TRADE if can_retake else HIGHLIGHT_HANG
+        pygame.draw.circle(screen, color, (cx, cy), r_dot)
 
 
 def legal_ends_for_piece(board, start, color, last_move=None):
@@ -2444,14 +2485,17 @@ depth_equations = {
     }
 
 def help():
-    # Bottom panel grouped by task (play / engines / neural / files)
-    help_h = 280
-    pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - help_h, SCREEN_WIDTH - 50, help_h))
+    # Draw entirely BELOW the board so it never covers pieces
+    help_h = 300
+    y0 = BOARD_PIXEL_H + 8
+    pygame.draw.rect(screen, WHITE, (25, y0, SCREEN_WIDTH - 50, help_h))
 
     small_font = pygame.font.SysFont("Arial", 18)
-    y = SCREEN_HEIGHT - help_h + 4
+    y = y0 + 4
 
     screen.blit(small_font.render("PLAY: click a piece (legal moves light up), then destination.  x = you vs AI   v = both AI   r = restart   f = flip", True, BLACK), (27, y))
+    y += 22
+    screen.blit(small_font.render("COLORS: c = toggle green/yellow/red hints  (green=safe, yellow=can retake, red=no retake; also marks what opponent can take)", True, BLACK), (27, y))
     y += 22
     screen.blit(small_font.render("ENGINES: a = White Search/Neural   z = Black Search/Neural   Up/Down = Search depth", True, BLACK), (27, y))
     y += 22
@@ -2481,6 +2525,10 @@ def help():
 
 # Add these dictionaries outside the help function:
 player = "W"
+ai = "B"
+player_turn = True
+actual_last_move = None
+setauto_switch_colors_for_player = False
 
 
 # Killer moves heuristic for better move ordering
@@ -2832,6 +2880,10 @@ while running:
                 initialize_game()
             if event.key == pygame.K_h:
                 help()
+            if event.key == pygame.K_c:
+                # Toggle green/yellow/red move + opponent-threat dots
+                show_move_colors = not show_move_colors
+                print(f"Move color hints {'ON' if show_move_colors else 'OFF'}")
 
             pygame.time.wait(100)
             redraw_board_with_selection()
