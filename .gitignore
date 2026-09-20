@@ -76,18 +76,32 @@ Thumbs.db
 *.tmp
 *.temp
 
-# Chess datasets (too large for git)
+# Chess datasets (too large for git) — keep local only; never commit
 Chess_games_old_txt/
 Chess_Games_txt/
+Chess_Games_Parquet/
 Saved Games/
 chess_parquet/
 chess_txt_promotion_win/
 combined_chess_datasets/
+*.parquet
+*.pgn
+*.csv
+# Training dumps outside this repo live under /home/jonathan/Data — not in git
 
 # Model files (too large for git)
 *.pth
+*.pt
+*.ckpt
+*.safetensors
 *.whl
 
 # Neural checkpoints live under Chess_LLM_models/ locally; keep only the directory in git
 Chess_LLM_models/*
 !Chess_LLM_models/.gitkeep
+
+# Local agent / cache junk
+.cursor/
+__pycache__/
+*.pyc
+agent-transcripts/

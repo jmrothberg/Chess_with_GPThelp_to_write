@@ -1,86 +1,76 @@
 """
 ChessBrain - Chess Move Prediction Transformer Model
+====================================================
+File: Chess_Brain_mp_spawn_9_20_26.py  (Sept 20, 2026)
+Preferred trainer: result-aware 4-token/classic, game packing, value head,
+single-GPU or multi-GPU via mp.spawn + DistributedDataParallel (NCCL).
 
-A specialized transformer model for chess move prediction, stripped down from Brain6
-for focused chess-only functionality. Uses chess move tokenization and game boundary masking.
+A specialized transformer for chess move prediction (from Brain6, chess-only).
+Uses move tokenization and game-boundary attention masking.
 
-BLACKWELL GB10 GPU TRAINING OPTIMIZATION
-=======================================
+SUPPORTED MACHINES (Sept 20, 2026)
+==================================
+1) DGX Spark / NVIDIA GB10 (Blackwell, ~128GB unified memory) — PRIMARY TRAIN TARGET
+   - Single-GPU training is the reliable default; large batches OK when CUDA kernels are current
+   - Unified-memory headroom + PYTORCH_ALLOC_CONF required (see below)
+   - torch.compile needs system CUDA 13 ptxas for sm_121a (TRITON_PTXAS_PATH)
 
-THIS RAN ON DGX SPARX WITHOUT MEMROY LEAK ISSUES BUT NOW I can get the configuration to work again
+2) Multi-GPU Ubuntu / Linux NVIDIA (NCCL DDP) — SUPPORTED
+   - Select 2+ CUDA GPUs at the interactive prompt; mp.spawn launches one worker per GPU
+   - Batch size is TOTAL across GPUs (must divide evenly)
+   - Requires NCCL (NVIDIA). Not AMD/Apple.
 
-
-Your Blackwell GB10 GPU (128GB unified memory) supports high-performance chess training:
-
-1. SINGLE GPU TRAINING (Recommended for stability)
-   - Optimized for Blackwell architecture with 128GB unified memory
-   - Batch size 32 recommended for stability (higher sizes may cause kernel issues)
-   - Maximum performance with Blackwell's advanced compute capabilities
-
-2. MEMORY OPTIMIZATION
-   - 128GB unified memory enables large model training
-   - Conservative batch sizing prevents Blackwell kernel compatibility issues
-   - PyTorch 2.5.1 + CUDA 12.4 provides stable Blackwell support
+3) Apple Mac (MPS) — PLAY / INFERENCE YES; FULL TRAINING NOT RECOMMENDED
+   - GUI + Chess_Inference: use Chess_9_20_26.py; set CHESS_DEVICE=mps if desired
+   - This trainer detects Darwin/MPS and has a single-device path, but multi-GPU DDP
+     will NOT run on Mac (NCCL is CUDA-only). Large parquet sessions are impractical
+     on laptop/desktop unified memory. Prefer train on Spark/Ubuntu, copy .pth to Mac.
+   - Checkpoint save path on Darwin defaults to /Users/jonathanrothberg/Data
 
 ARCHITECTURE OVERVIEW:
-- Chess-specific tokenization (moves + game boundaries)
-- MultiQueryAttention for efficient attention computation
-- RMSNorm for improved training stability
-- SwiGLU activation in feed-forward layers
-- Game boundary masking for proper sequence separation
+- Chess-specific tokenization (moves + game boundaries); classic or 4-token mode
+- Grouped-Query / MultiQueryAttention, RMSNorm, SwiGLU FFN
+- Game boundary masking; optional result tokens + value head (result-aware)
 
-CURRENT STATUS (PyTorch 2.10.0.dev CUDA 13.0 nightly):
-- ✅ Blackwell GB10 GPU: 128GB unified memory, compute capability 12.1
-- ✅ Single GPU training: Optimized for Blackwell architecture
-- ✅ Batch sizes: 64, 256, 1024+ all working (CUDA 13 kernel support)
-- ✅ CUDA 13.0: Full Blackwell compatibility achieved
-- ✅ Model architecture: Chess-optimized transformer with MultiQueryAttention
+DGX SPARK / GB10 NOTES (working setup — adjust only if your stack differs):
+==========================================================================
+- PyTorch: 2.9.x+cu128 (CUDA 12.8) or newer CUDA 13 nightlies when GB10-stable
+- System CUDA: 12.8+ (13.x ptxas for compile on sm_121a)
+- GPU: NVIDIA GB10 Blackwell (compute capability 12.1), unified memory
+- Batch sizes: take the script's free-RAM recommendation (often ~64–100 on GB10)
+- Save path Linux: /home/jonathan/Data/ (fallback /data/Data)
 
-RECOMMENDED USAGE:
-- For reliable training: Single GPU (GPU 0) with large batch sizes
-- For faster training: Multi-GPU DataParallel (monitor for stability)
-- Chess-specific optimizations: MultiQueryAttention, game masking, RMSNorm
+CRITICAL BLACKWELL MEMORY FRAGMENTATION FIX (PyTorch 2.9+):
+==========================================================
+PyTorch 2.9+ ignores PYTORCH_CUDA_ALLOC_CONF — use PYTORCH_ALLOC_CONF.
 
-CURRENT WORKING SETUP (DO NOT CHANGE):
-====================================
-- PyTorch: 2.9.0+cu128 (CUDA 12.8)
-- System CUDA: 12.8
-- GPU: NVIDIA GB10 Blackwell (128GB unified memory, compute capability 12.1)
-- Batch sizes: 64, 256, 1024+ all working
-- Save path: /home/jonathan/Data/ (not /data/)
-
-⚠️  CRITICAL BLACKWELL MEMORY LEAK FIX (October 2025):
-=====================================================
-PyTorch 2.9+ DEPRECATED old environment variable names. Must use NEW names!
-
-REQUIRED environment variables (set in .venv/bin/activate):
+REQUIRED in .venv/bin/activate (or ./setup_blackwell.sh):
   export PYTORCH_ALLOC_CONF="max_split_size_mb:512,expandable_segments:True,garbage_collection_threshold:0.8"
   export CUDA_DEVICE_MAX_CONNECTIONS=32
   export CUDA_AUTO_BOOST=0
 
-WHY THIS IS CRITICAL:
-- OLD variable: PYTORCH_CUDA_ALLOC_CONF (deprecated, PyTorch 2.9+ ignores it)
-- NEW variable: PYTORCH_ALLOC_CONF (required for PyTorch 2.9+)
-- Without these settings, Blackwell GPUs leak memory due to fragmentation
-- Memory accumulates and eventually causes OOM crashes
+Verify:
+  python3 -c "import os; print(os.getenv('PYTORCH_ALLOC_CONF'))"   # must not be None
 
-IF YOU RECREATE .venv:
-1. Run: ./setup_blackwell.sh (automatically adds variables to activation script)
-2. OR manually add the exports above to .venv/bin/activate
-3. Deactivate and reactivate venv to apply
-
-TO VERIFY VARIABLES ARE SET:
-  python3 -c "import os; print('PYTORCH_ALLOC_CONF:', os.getenv('PYTORCH_ALLOC_CONF'))"
-  Should print the configuration, NOT None
+Launch:
+  python Chess_Brain_mp_spawn_9_20_26.py
 """
 
 import os
 import platform
 import re
+# GB10 / DGX Spark: Triton's bundled ptxas is CUDA 12.8 and does not know sm_121a, so
+# torch.compile dies with "ptxas fatal: Value 'sm_121a' is not defined". Point Triton at
+# the system CUDA 13 assembler before torch loads. Harmless on machines without that path.
+if not os.environ.get('TRITON_PTXAS_PATH'):
+    _cuda13_ptxas = '/usr/local/cuda/bin/ptxas'
+    if os.path.isfile(_cuda13_ptxas):
+        os.environ['TRITON_PTXAS_PATH'] = _cuda13_ptxas
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import math
+import random   # <U> result masking in _PreTokenizedDataset (Sep 2026)
 import signal
 import sys
 import pandas as pd
@@ -96,11 +86,61 @@ import torch.multiprocessing as mp
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+
+def _uses_unified_memory():
+    """True when CUDA 'VRAM' is the same RAM the OS uses (NVIDIA GB10 / DGX Spark).
+    Treating that pool like a discrete GPU and filling 80% of it freezes the desktop."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        if 'GB10' in torch.cuda.get_device_name(0).upper():
+            return True
+        gpu = float(torch.cuda.get_device_properties(0).total_memory)
+        sys_ram = float(os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES'))
+        return abs(gpu - sys_ram) / max(sys_ram, 1.0) < 0.15
+    except Exception:
+        return False
+
+
+# Keep this much RAM actually free on unified-memory boxes. The desktop is already in
+# "used"; this is only headroom for spikes (compile, compositor, tokenizer). 32GB+50%
+# made batch 21 look silly on a 128GB Spark.
+UNIFIED_HEADROOM_BYTES = 16 * (1024 ** 3)
+
+
+def _unified_cuda_fraction(free, total):
+    """CUDA allocator cap = everything currently free except UNIFIED_HEADROOM_BYTES."""
+    usable = max(UNIFIED_HEADROOM_BYTES, free - UNIFIED_HEADROOM_BYTES)
+    return max(0.15, min(0.70, usable / max(total, 1)))
+
+
+def _dataloader_kwargs(batch_size, shuffle=True, sampler=None):
+    """Fewer workers and no pin_memory on unified-memory boxes (pinning is extra copies of the same RAM)."""
+    unified = _uses_unified_memory()
+    if unified:
+        num_workers = min(2, os.cpu_count() or 1)
+        pin, prefetch = False, 2
+    else:
+        num_workers = min(8, (os.cpu_count() or 2) // 2)
+        pin, prefetch = True, 2
+    kw = dict(batch_size=batch_size, drop_last=True, num_workers=num_workers,
+              pin_memory=pin, persistent_workers=(num_workers > 0),
+              prefetch_factor=prefetch if num_workers > 0 else None)
+    if sampler is not None:
+        kw['sampler'] = sampler
+    else:
+        kw['shuffle'] = shuffle
+    return kw
+
 # Prioritize MPS on Mac systems for native GPU support
+# NOTE (Sept 20, 2026): Mac/MPS is for light experiments only — not a supported
+# train target. Multi-GPU DDP needs NCCL (NVIDIA). Prefer train on Spark/Ubuntu;
+# play on Mac via Chess_9_20_26.py + a copied .pth (see README.md).
 if platform.system() == "Darwin" and torch.backends.mps.is_available():
     device = torch.device('mps')
     gpu_indices = []  # MPS doesn't use gpu_indices like CUDA
     print("Using MPS GPU")
+    print("WARNING: Full Stockfish-parquet training on Mac is not the supported workflow.")
 elif torch.cuda.is_available() and not os.environ.get('_CHESS_DDP_WORKER'):
     # Main process only — DDP workers skip this to avoid creating parasitic CUDA contexts on GPU 0
     gpu_indices = None
@@ -127,12 +167,24 @@ elif torch.cuda.is_available() and not os.environ.get('_CHESS_DDP_WORKER'):
     print("Using CUDA with optimized settings")
     # Set CUDA to release memory when possible - helps prevent OOM errors
     torch.cuda.empty_cache()
-    # Conservative memory allocation to prevent crashes with VNC/Cinnamon
-    torch.cuda.set_per_process_memory_fraction(0.80)
+    # Conservative memory allocation. Discrete GPUs: 80% VRAM is fine (desktop uses system RAM).
+    # GB10 unified memory: cap CUDA to (currently free minus 16GB headroom), not a fixed 80%/45%
+    # of the whole 128GB pool (that is what froze the desktop).
+    if _uses_unified_memory():
+        _free, _total = torch.cuda.mem_get_info(0)
+        _frac = _unified_cuda_fraction(_free, _total)
+        torch.cuda.set_per_process_memory_fraction(_frac)
+        print(f"GB10 unified memory: CUDA capped at {_frac:.0%} of RAM "
+              f"(keeps {UNIFIED_HEADROOM_BYTES/2**30:.0f} GB free for the desktop)")
+    else:
+        torch.cuda.set_per_process_memory_fraction(0.80)
 elif torch.cuda.is_available():
     # DDP worker process — minimal setup, per-rank device configured in _ddp_train_worker
     gpu_indices = None
     device = torch.device('cuda')
+    if _uses_unified_memory():
+        _free, _total = torch.cuda.mem_get_info(0)
+        torch.cuda.set_per_process_memory_fraction(_unified_cuda_fraction(_free, _total))
 else:
     print("ERROR: No GPU available. This chess training requires GPU support (CUDA or MPS).")
     exit(1)
@@ -173,15 +225,37 @@ EOFG = 136
 PAD = 137
 W_RESULT = 138
 D_RESULT = 139
+# Result-aware training (Sep 2026): new tokens appended so all existing ids stay put.
+B_RESULT = 140   # <B> black won (0-1). Previously 0-1 was lumped into <D>.
+U_RESULT = 141   # <U> unknown result: replaces the result token in the INPUT for some games
+                 # so the value head has to predict the outcome instead of reading it.
 
-ROLE_VOCAB_SIZE = 140
+ROLE_VOCAB_SIZE = 142
+
+# Result tokens shared by both token modes (names used in text / classic vocab)
+RESULT_TOKEN_NAMES = ['<W>', '<D>', '<B>', '<U>']
+# Classic-mode special tokens appended after the 20,160 move tokens (order matters for ids)
+CLASSIC_SPECIAL_TOKENS = ['<STARTGAME>', '<EOFG>', '<PAD>', '<W>', '<D>', '<B>', '<U>']
+# Value head classes: 0 = white wins, 1 = draw, 2 = black wins
+VALUE_CLASS_FOR_RESULT_TOKEN = {W_RESULT: 0, D_RESULT: 1, B_RESULT: 2}
+# Classic vocab: 64 from x 63 to x 5 promo = 20,160 move tokens, then the specials above
+CLASSIC_MOVE_TOKENS = 64 * 63 * 5
+
+
+def classic_special_ids():
+    """Classic-mode ids of the special tokens (fixed offsets after the move tokens).
+    <STARTGAME>=20160 ... <D>=20164 match the old vocab; <B>=20165, <U>=20166 are new."""
+    return {name: CLASSIC_MOVE_TOKENS + i for i, name in enumerate(CLASSIC_SPECIAL_TOKENS)}
 
 # Chess defaults - optimized for 10M Stockfish games on 4×48GB GPUs
 CHESS_DEFAULTS = {
     'n_embd': 512,       # Embedding dimension (512/8=64 per head)
     'n_head': 8,         # Query heads
     'n_kv_heads': 2,     # KV heads (4:1 GQA ratio)
-    'block_size': 512,   # 4-token mode default (512/4=128 half-moves=64 full moves)
+    # Stockfish self-play median ~168 plies, p95 ~353. 4-token uses 4 tokens/ply, so 512
+    # (128 plies) truncated ~79% of games. 1536 tokens = 384 plies covers ~97%; packing
+    # fills leftover space with whole shorter games.
+    'block_size': 1536,
     'n_layer': 12,       # Transformer layers - deeper for tactical depth
     'dropout': 0.0,      # No dropout - Stockfish games are deterministic, no noise to regularize
     'batch_size': 512,   # Split across 4 GPUs (128 per GPU) - safe for 48GB GPUs
@@ -189,6 +263,10 @@ CHESS_DEFAULTS = {
     'learning_rate': 4e-4,  # Learning rate - stable for short sessions
     'weight_decay': 0.01,   # Standard regularization
     'max_norm': 5.0,     # Gradient clipping threshold (increased to reduce clipping frequency)
+    # --- Result-aware training (Sep 2026) ---
+    'loser_move_weight': 0.5,  # Loss weight on moves played by the side that LOST (winner/draw moves = 1.0)
+    'value_loss_weight': 0.2,  # Weight of the auxiliary value head (predict W/D/B from moves so far)
+    'value_mask_prob': 0.5,    # Fraction of games whose input result token is replaced by <U> (value head trains on these)
 }
 
 # Core model components for chess move prediction
@@ -441,7 +519,8 @@ class MultiQueryAttention(nn.Module):
         self.k_norm = RMSNorm(head_dim)
 
         self.dropout = nn.Dropout(dropout)
-        self.register_buffer('causal_mask', torch.tril(torch.ones(1024, 1024)))
+        # Causal mask is built per-forward from T. A fixed 1024x1024 buffer explodes
+        # torch.compile when block_size > 1024 (1536 default).
         self.flash_available = hasattr(F, 'scaled_dot_product_attention')
 
         # Flash attention availability logged at model level, not per-layer
@@ -467,30 +546,27 @@ class MultiQueryAttention(nn.Module):
         v = v.unsqueeze(2).expand(B, self.n_kv_heads, repeat, T, self.head_dim).reshape(B, self.n_heads, T, self.head_dim)
 
         if self.flash_available:
-            # Prepare masks
-            causal_mask = self.causal_mask[:T, :T].bool()
             if mask is not None:
-                game_mask = mask[:, :T, :T].bool()
-                combined_mask = torch.logical_and(
-                    causal_mask.unsqueeze(0),
-                    game_mask
+                # Causal AND game-boundary mask, sized to this forward's T (not a 1024 buffer)
+                causal = torch.ones(T, T, dtype=torch.bool, device=x.device).tril()
+                combined_mask = causal.unsqueeze(0) & mask[:, :T, :T].bool()
+                y = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=combined_mask.unsqueeze(1),
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    is_causal=False
                 )
             else:
-                combined_mask = causal_mask.unsqueeze(0)
-
-            attention_mask = combined_mask.unsqueeze(1)
-
-            # Use flash attention (SDPA auto-selects optimal backend)
-            y = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attention_mask,
-                dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal=False
-            )
+                y = F.scaled_dot_product_attention(
+                    q, k, v,
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    is_causal=True
+                )
         else:
             # Fallback attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.causal_mask[:T, :T] == 0, float('-inf'))
+            causal = torch.ones(T, T, device=x.device).tril()
+            att = att.masked_fill(causal == 0, float('-inf'))
             if mask is not None:
                 att = att.masked_fill(mask[:, :T, :T].unsqueeze(1) == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
@@ -705,15 +781,29 @@ class ChessModel(nn.Module):
         use_chess: Enable chess-specific masking (always True for ChessModel)
         use_dna: Enable DNA-specific features (always False for ChessModel)
     """
-    def __init__(self, vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout, use_chess=False, use_dna=False, token_mode='4token'):
+    def __init__(self, vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout, use_chess=False, use_dna=False, token_mode='4token',
+                 use_value_head=True, packed_positions=True,
+                 loser_move_weight=None, value_loss_weight=None):
         super().__init__()
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.use_chess = use_chess
         self.use_dna = use_dna
         self.token_mode = token_mode  # 'classic' or '4token'
+        # --- Result-aware training options (Sep 2026) ---
+        # Special-token ids for this mode. Classic ids are fixed offsets after the 20,160 move
+        # tokens, so they are valid for old (20,165) and new (20,167) classic vocabs alike.
+        self.special_ids = classic_special_ids() if token_mode == 'classic' else {
+            '<STARTGAME>': STARTGAME, '<EOFG>': EOFG, '<PAD>': PAD,
+            '<W>': W_RESULT, '<D>': D_RESULT, '<B>': B_RESULT, '<U>': U_RESULT}
+        self.use_value_head = use_value_head          # auxiliary W/D/B head
+        self.packed_positions = packed_positions      # position ids restart at each <STARTGAME>
+        self.loser_move_weight = CHESS_DEFAULTS['loser_move_weight'] if loser_move_weight is None else loser_move_weight
+        self.value_loss_weight = CHESS_DEFAULTS['value_loss_weight'] if value_loss_weight is None else value_loss_weight
         if use_chess:
             self.start_game_token = move_to_idx['<STARTGAME>'] if 'move_to_idx' in globals() else None
+            if self.start_game_token is None:
+                self.start_game_token = self.special_ids['<STARTGAME>']
 
         # Standard embeddings
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
@@ -749,6 +839,11 @@ class ChessModel(nn.Module):
 
             # FROM conditioning embedding for TO prediction
             self.emb_from = nn.Embedding(64, n_embd)
+
+        # Value head (Sep 2026): predicts final result (0=W, 1=D, 2=B) from the moves so far.
+        # Trained only on games whose input result token was masked to <U>, so it cannot cheat.
+        if self.use_value_head:
+            self.head_value = nn.Linear(n_embd, 3)
 
         # Log flash attention once
         flash_available = hasattr(F, 'scaled_dot_product_attention')
@@ -792,12 +887,30 @@ class ChessModel(nn.Module):
         mask = (game_boundaries.unsqueeze(1) == game_boundaries.unsqueeze(2)).float()
         return mask
 
-    def forward(self, idx, targets=None, target_roles=None):
+    # ---------------------------------------------------------------------------------
+    # Result-aware helpers (Sep 2026)
+    # ---------------------------------------------------------------------------------
+    def game_start_index(self, idx):
+        """For every position t, index of the most recent <STARTGAME> at or before t
+        (0 if none, e.g. a truncated inference prompt). Shape [B, T]."""
         B, T = idx.shape
+        t = torch.arange(T, device=idx.device).unsqueeze(0).expand(B, T)
+        is_start = (idx == self.start_game_token)
+        # cummax carries the last start position forward through each game
+        start_idx = torch.where(is_start, t, torch.zeros_like(t)).cummax(dim=1).values
+        return start_idx
 
-        # Get embeddings (use pre-registered position indices)
+    def _backbone(self, idx):
+        """Embeddings + transformer blocks + final norm. Returns hidden states [B, T, n_embd]."""
+        B, T = idx.shape
         tok_emb = self.token_embedding_table(idx)
-        pos_emb = self.position_embedding_table(self.pos_indices[:T])
+        if self.packed_positions and self.use_chess:
+            # Position ids restart at every <STARTGAME> so packed games each start at position 0.
+            # A single-game prompt (starts with <STARTGAME>) gets the same positions as before.
+            pos_ids = (self.pos_indices[:T].unsqueeze(0) - self.game_start_index(idx)).clamp(0, self.block_size - 1)
+            pos_emb = self.position_embedding_table(pos_ids)
+        else:
+            pos_emb = self.position_embedding_table(self.pos_indices[:T])
         x = tok_emb + pos_emb
 
         # Compute game mask ONCE, reuse across all layers (was computed per-layer before)
@@ -806,7 +919,63 @@ class ChessModel(nn.Module):
             x = block(x, mask=game_mask)
 
         # Final normalization
-        x = self.rms_final(x)
+        return self.rms_final(x)
+
+    def _move_weights_and_value_targets(self, idx, targets):
+        """
+        Per-position training signals derived from the result token of each game.
+
+        Returns (move_w, value_tgt, value_mask), all flattened to [B*T]:
+          move_w     - 1.0 for winner/draw moves, self.loser_move_weight for moves by the LOSING side
+          value_tgt  - class 0/1/2 (W/D/B) of the game's true result, -1 where unknown
+          value_mask - True where the value head should be trained: input result token is <U>
+                       and the true result is known.
+        The TRUE result is read from targets[start_idx] (= x[start_idx+1] before any <U> masking).
+        """
+        B, T = idx.shape
+        sp = self.special_ids
+        start_idx = self.game_start_index(idx)                       # [B, T]
+        true_result = targets.gather(1, start_idx)                   # [B, T] true result token per position
+        input_result = idx.gather(1, (start_idx + 1).clamp(max=T - 1))  # what the model actually saw
+
+        # Target at position t is token x[t+1]; its offset inside the game is q = (t+1) - start
+        q = self.pos_indices[:T].unsqueeze(0) + 1 - start_idx
+        tokens_per_move = 1 if self.token_mode == 'classic' else 4
+        move_idx = (q - 2) // tokens_per_move                        # 0 = white's first move
+        mover_is_white = (move_idx % 2 == 0)
+        winner_white = (true_result == sp['<W>'])
+        winner_black = (true_result == sp['<B>'])
+        mover_lost = (winner_white & ~mover_is_white) | (winner_black & mover_is_white)
+        move_w = torch.where(mover_lost & (q >= 2),
+                             torch.full_like(q, self.loser_move_weight, dtype=torch.float32),
+                             torch.ones(q.shape, device=idx.device, dtype=torch.float32))
+
+        value_tgt = torch.full_like(true_result, -1)
+        value_tgt = torch.where(winner_white, torch.zeros_like(value_tgt), value_tgt)
+        value_tgt = torch.where(true_result == sp['<D>'], torch.ones_like(value_tgt), value_tgt)
+        value_tgt = torch.where(winner_black, torch.full_like(value_tgt, 2), value_tgt)
+        value_mask = (input_result == sp['<U>']) & (value_tgt >= 0) & (q >= 2)
+        return move_w.view(B * T), value_tgt.view(B * T), value_mask.view(B * T)
+
+    def _value_loss(self, h_flat, value_tgt, value_mask):
+        """Cross-entropy of the value head on masked positions; returns (loss or None)."""
+        if not self.use_value_head or not value_mask.any():
+            return None
+        logits = self.head_value(h_flat[value_mask])
+        return F.cross_entropy(logits, value_tgt[value_mask])
+
+    @torch.no_grad()
+    def predict_value(self, idx):
+        """Softmax over (W, D, B) at the last position. Prompt should start <STARTGAME> <U>."""
+        if not self.use_value_head:
+            return None
+        h = self._backbone(idx)
+        return F.softmax(self.head_value(h[:, -1]), dim=-1)
+
+    def forward(self, idx, targets=None, target_roles=None):
+        B, T = idx.shape
+
+        x = self._backbone(idx)
 
         # ===== CLASSIC MODE: standard next-token prediction =====
         if self.token_mode == 'classic':
@@ -815,11 +984,21 @@ class ChessModel(nn.Module):
                 logits_flat = logits.view(B * T, -1)
                 targets_flat = targets.view(B * T)
                 # Ignore PAD positions (y_roles == -1 sentinel from ClassicChessMovesDataset)
-                pad_id = self.vocab_size - 3  # PAD is 3rd-to-last special token
+                pad_id = self.special_ids['<PAD>']  # fixed offset after the move tokens (was vocab_size-3, broke when <B>/<U> were appended)
                 label_smoothing = getattr(self, 'label_smoothing', 0.0)
-                loss = F.cross_entropy(logits_flat, targets_flat,
-                                       ignore_index=pad_id,
-                                       label_smoothing=label_smoothing)
+                # Winner-weighted loss (Sep 2026): per-token CE, loser's moves downweighted
+                move_w, value_tgt, value_mask = self._move_weights_and_value_targets(idx, targets)
+                ce = F.cross_entropy(logits_flat, targets_flat,
+                                     ignore_index=pad_id,
+                                     label_smoothing=label_smoothing,
+                                     reduction='none')
+                valid = (targets_flat != pad_id).float()
+                w = move_w * valid
+                loss = (ce * w).sum() / w.sum().clamp(min=1.0)
+                loss_value = self._value_loss(x.view(B * T, -1), value_tgt, value_mask & (valid > 0))
+                if loss_value is not None:
+                    loss = loss + self.value_loss_weight * loss_value
+                self._last_head_losses = {'value': loss_value.item() if loss_value is not None else -1}
                 return logits, loss
             else:
                 return logits, None
@@ -846,6 +1025,14 @@ class ChessModel(nn.Module):
             w_color = 0.5
             w_promo = 1.0
 
+            # Winner-weighted loss (Sep 2026): per-token weight 1.0 for the winner's / drawn
+            # moves, self.loser_move_weight for the loser's moves. Also value-head targets.
+            move_w, value_tgt, value_mask = self._move_weights_and_value_targets(idx, targets)
+
+            def _weighted_ce(logits, tgt, w):
+                ce = F.cross_entropy(logits, tgt, label_smoothing=label_smoothing, reduction='none')
+                return (ce * w).sum() / w.sum().clamp(min=1.0)
+
             losses = []
 
             # COLOR loss (downweighted — trivially predictable, don't waste capacity)
@@ -860,8 +1047,7 @@ class ChessModel(nn.Module):
             if from_mask.any():
                 from_logits = self.head_from(h[from_mask])
                 from_targets = targets_flat[from_mask] - FROM_OFFSET
-                loss_from = F.cross_entropy(from_logits, from_targets,
-                                            label_smoothing=label_smoothing)
+                loss_from = _weighted_ce(from_logits, from_targets, move_w[from_mask])
                 losses.append(loss_from)
 
             # TO loss (conditioned on FROM via emb_from, unchanged)
@@ -873,16 +1059,14 @@ class ChessModel(nn.Module):
                 h_to = h_to + self.emb_from(from_local)
                 to_logits = self.head_to(h_to)
                 to_targets = targets_flat[to_mask] - TO_OFFSET
-                loss_to = F.cross_entropy(to_logits, to_targets,
-                                          label_smoothing=label_smoothing)
+                loss_to = _weighted_ce(to_logits, to_targets, move_w[to_mask])
                 losses.append(loss_to)
 
             # PROMO loss (equal weight — mostly "none" predictions)
             if promo_mask.any():
                 promo_logits = self.head_promo(h[promo_mask])
                 promo_targets = targets_flat[promo_mask] - PROMO_OFFSET
-                loss_promo = F.cross_entropy(promo_logits, promo_targets,
-                                             label_smoothing=label_smoothing)
+                loss_promo = _weighted_ce(promo_logits, promo_targets, move_w[promo_mask])
                 losses.append(loss_promo * w_promo)
 
             if losses:
@@ -890,24 +1074,33 @@ class ChessModel(nn.Module):
             else:
                 loss = torch.tensor(0.0, device=idx.device)
 
+            # Value loss (Sep 2026): only on positions inside games whose input result was <U>
+            loss_value = self._value_loss(h, value_tgt, value_mask & (roles_flat != ROLE_SPECIAL))
+            if loss_value is not None:
+                loss = loss + self.value_loss_weight * loss_value
+
             # Store per-head losses for diagnostic logging
             self._last_head_losses = {
                 'color': loss_color.item() if color_mask.any() else -1,
                 'from': loss_from.item() if from_mask.any() else -1,
                 'to': loss_to.item() if to_mask.any() else -1,
                 'promo': loss_promo.item() if promo_mask.any() else -1,
+                'value': loss_value.item() if loss_value is not None else -1,
             }
 
             return None, loss
         else:
             # Inference mode: return hidden states + head logits
             # TO logits not returned here (need per-token FROM conditioning at generation time)
-            return {
+            out = {
                 'hidden': x,
                 'color': self.head_color(x),
                 'from': self.head_from(x),
                 'promo': self.head_promo(x),
-            }, None
+            }
+            if self.use_value_head:
+                out['value'] = self.head_value(x)   # [B, T, 3] logits over (W, D, B)
+            return out, None
 
 
 # Chess dataset and utility functions
@@ -997,6 +1190,14 @@ class ChessMovesDataset(Dataset):
                 i += 3
             elif text[i:i+3] == '<D>':
                 self.tokens.append(D_RESULT)
+                self.roles.append(ROLE_SPECIAL)
+                i += 3
+            elif text[i:i+3] == '<B>':   # Sep 2026: black-win result token
+                self.tokens.append(B_RESULT)
+                self.roles.append(ROLE_SPECIAL)
+                i += 3
+            elif text[i:i+3] == '<U>':   # Sep 2026: unknown-result token
+                self.tokens.append(U_RESULT)
                 self.roles.append(ROLE_SPECIAL)
                 i += 3
             elif text[i].isspace():
@@ -1113,6 +1314,12 @@ class ClassicChessMovesDataset(Dataset):
             elif text[i:i+3] == '<D>':
                 self.tokens.append(self.move_to_idx['<D>'])
                 i += 3
+            elif text[i:i+3] == '<B>':   # Sep 2026: black-win result token
+                self.tokens.append(self.move_to_idx['<B>'])
+                i += 3
+            elif text[i:i+3] == '<U>':   # Sep 2026: unknown-result token
+                self.tokens.append(self.move_to_idx['<U>'])
+                i += 3
             elif text[i].isspace():
                 i += 1
             elif i + 4 <= text_len:
@@ -1170,36 +1377,86 @@ class ClassicChessMovesDataset(Dataset):
 
 
 class _PreTokenizedDataset(Dataset):
-    """Wraps pre-tokenized tensors to avoid re-tokenizing in each DDP worker process."""
-    def __init__(self, tokens_tensor, roles_tensor, seq_length, token_mode, move_to_idx):
+    """
+    Wraps pre-tokenized tensors to avoid re-tokenizing in each DDP worker process.
+
+    Sep 2026 additions:
+    - Game packing: each row holds as many WHOLE games as fit in seq_length (was one game
+      per row + padding). A game that does not fit becomes the first game of the next row,
+      so nothing is duplicated; the leftover tail of the row is <PAD>. Games longer than
+      seq_length are truncated exactly as before. Position ids restart per game inside the
+      model (ChessModel.packed_positions), and the game mask already isolates games.
+    - <U> masking: with probability value_mask_prob the result token of a game is replaced
+      by <U> in x only (y keeps the true result), so the value head must predict the result.
+    """
+    def __init__(self, tokens_tensor, roles_tensor, seq_length, token_mode, move_to_idx,
+                 pack_games=True, value_mask_prob=None, verbose=True):
         self.tokens_tensor = tokens_tensor
         self.roles_tensor = roles_tensor
         self.seq_length = seq_length
         self.token_mode = token_mode
+        self.pack_games = pack_games
 
         if token_mode == 'classic':
             self.pad_token = move_to_idx['<PAD>']
             startgame_id = move_to_idx['<STARTGAME>']
+            self.u_token = move_to_idx.get('<U>')  # None for an old 20,165-token vocab -> no masking
+            self.result_ids = {move_to_idx[n] for n in ('<W>', '<D>', '<B>') if n in move_to_idx}
         else:
             self.pad_token = PAD
             startgame_id = STARTGAME
+            self.u_token = U_RESULT
+            self.result_ids = {W_RESULT, D_RESULT, B_RESULT}
 
-        self._game_starts = torch.nonzero(
-            self.tokens_tensor == startgame_id, as_tuple=False
-        ).flatten().tolist()
+        self.value_mask_prob = CHESS_DEFAULTS['value_mask_prob'] if value_mask_prob is None else value_mask_prob
+        if self.u_token is None:
+            self.value_mask_prob = 0.0
+
+        game_starts = torch.nonzero(self.tokens_tensor == startgame_id, as_tuple=False).flatten()
+        self._game_starts = game_starts.tolist()
+        n_tokens = len(self.tokens_tensor)
+
+        if pack_games and len(self._game_starts) > 0:
+            self._build_packed_rows(game_starts, n_tokens, verbose)
+        else:
+            # One game per row (legacy behaviour)
+            self._row_start = self._game_starts
+            self._row_end = [min(s + seq_length, n_tokens) for s in self._game_starts]
+
+    def _build_packed_rows(self, game_starts, n_tokens, verbose):
+        """Greedy packing: row j..k holds whole games while game_end[k] - start_j <= seq_length."""
+        import numpy as np
+        gs = game_starts.numpy().astype(np.int64)
+        game_end = np.concatenate([gs[1:], np.array([n_tokens], dtype=np.int64)])  # exclusive end per game
+        row_start, row_end = [], []
+        j, n_games, truncated = 0, len(gs), 0
+        while j < n_games:
+            limit = gs[j] + self.seq_length
+            n = int(np.searchsorted(game_end, limit, side='right'))  # games 0..n-1 end within limit
+            if n <= j:
+                # First game alone is longer than seq_length: truncate it (same as before packing)
+                row_start.append(int(gs[j])); row_end.append(int(limit)); truncated += 1
+                j += 1
+            else:
+                row_start.append(int(gs[j])); row_end.append(int(game_end[n - 1]))
+                j = n
+        self._row_start, self._row_end = row_start, row_end
+        if verbose:
+            real = sum(e - s for s, e in zip(row_start, row_end))
+            print(f"Packed {n_games:,} games into {len(row_start):,} rows of {self.seq_length} "
+                  f"({real / max(len(row_start), 1):.0f} real tokens/row avg, "
+                  f"{n_games / max(len(row_start), 1):.2f} games/row, {truncated:,} games longer than seq_length truncated)")
 
     def __len__(self):
-        return len(self._game_starts)
+        return len(self._row_start)
 
     def __getitem__(self, idx):
-        start_pos = self._game_starts[idx]
+        s, e = self._row_start[idx], self._row_end[idx]
         len_file = len(self.tokens_tensor)
 
-        x_end = min(start_pos + self.seq_length, len_file)
-        x_data = self.tokens_tensor[start_pos:x_end]
-
-        y_end = min(start_pos + self.seq_length + 1, len_file)
-        y_data = self.tokens_tensor[start_pos + 1:y_end]
+        x_data = self.tokens_tensor[s:e]
+        y_end = min(e + 1, len_file)
+        y_data = self.tokens_tensor[s + 1:y_end]
 
         x = torch.full((self.seq_length,), self.pad_token, dtype=torch.long)
         y = torch.full((self.seq_length,), self.pad_token, dtype=torch.long)
@@ -1210,9 +1467,16 @@ class _PreTokenizedDataset(Dataset):
         if self.token_mode == 'classic':
             y_roles = torch.full((self.seq_length,), -1, dtype=torch.long)
         else:
-            y_roles_data = self.roles_tensor[start_pos + 1:y_end]
+            y_roles_data = self.roles_tensor[s + 1:y_end]
             y_roles = torch.full((self.seq_length,), ROLE_SPECIAL, dtype=torch.long)
             y_roles[:len(y_roles_data)] = y_roles_data
+
+        # <U> masking for the value head: hide the result token in the INPUT of some games
+        if self.value_mask_prob > 0:
+            starts_in_row = torch.nonzero(x_data == self.tokens_tensor[s], as_tuple=False).flatten()  # <STARTGAME> positions
+            for rel in starts_in_row.tolist():
+                if rel + 1 < len(x_data) and x[rel + 1].item() in self.result_ids and random.random() < self.value_mask_prob:
+                    x[rel + 1] = self.u_token
 
         return x, y, y_roles
 
@@ -1240,6 +1504,14 @@ def process_chunk_for_chess_moves(args):
             i += 3
         elif chunk_text[i:i+3] == '<D>':
             chunk_tokens.append(D_RESULT)
+            chunk_roles.append(ROLE_SPECIAL)
+            i += 3
+        elif chunk_text[i:i+3] == '<B>':   # Sep 2026: black-win result token
+            chunk_tokens.append(B_RESULT)
+            chunk_roles.append(ROLE_SPECIAL)
+            i += 3
+        elif chunk_text[i:i+3] == '<U>':   # Sep 2026: unknown-result token
+            chunk_tokens.append(U_RESULT)
             chunk_roles.append(ROLE_SPECIAL)
             i += 3
         elif chunk_text[i].isspace():
@@ -1364,6 +1636,8 @@ def create_move_to_idx():
     move_to_idx['<PAD>'] = PAD
     move_to_idx['<W>'] = W_RESULT
     move_to_idx['<D>'] = D_RESULT
+    move_to_idx['<B>'] = B_RESULT   # Sep 2026: black win (140)
+    move_to_idx['<U>'] = U_RESULT   # Sep 2026: unknown result for value head (141)
 
     return move_to_idx
 
@@ -1395,8 +1669,8 @@ def create_classic_move_to_idx():
                 move_id = (from_sq * 63 * 5) + (to_offset * 5) + promo_idx
                 move_str = f"{from_file}{from_rank}{to_file}{to_rank}{promo_char}".upper()
                 m[move_str] = move_id
-    # Special tokens start after move tokens
-    for idx, token in enumerate(['<STARTGAME>', '<EOFG>', '<PAD>', '<W>', '<D>'], start=len(m)):
+    # Special tokens start after move tokens (<B>, <U> appended Sep 2026 -> 20,167 total)
+    for idx, token in enumerate(CLASSIC_SPECIAL_TOKENS, start=len(m)):
         m[token] = idx
     return m
 
@@ -1413,7 +1687,10 @@ def _result_to_token(result_str):
     """Convert game result string to token marker."""
     if result_str == "1-0":
         return "<W>"
-    # Treat 0-1, 1/2-1/2, draws, and anything else as <D>
+    # Sep 2026: black wins get their own token (was lumped into <D> before)
+    if result_str == "0-1":
+        return "<B>"
+    # 1/2-1/2, draws, and anything else -> <D>
     return "<D>"
 
 
@@ -1477,9 +1754,9 @@ def load_chess_file():
                 game = game.strip()
                 if not game:
                     continue
-                # Extract result marker (<W> or <D>) and moves
-                if game.startswith('<W> ') or game.startswith('<D> '):
-                    marker = game[:3]  # <W> or <D>
+                # Extract result marker (<W>, <D> or <B>) and moves
+                if game.startswith('<W> ') or game.startswith('<D> ') or game.startswith('<B> '):
+                    marker = game[:3]  # <W>, <D> or <B>
                     moves = game[4:]  # Rest is moves
                     processed_games.append(f'<STARTGAME> {marker} {moves} <EOFG>')
                 else:
@@ -1627,6 +1904,12 @@ def save_model_all(model, all_text, n_embd, n_head, n_kv_heads, n_layer, dropout
             'label_smoothing': getattr(model_module, 'label_smoothing', 0.0),
             'use_chess': True,
             'use_dna': False,
+            # Result-aware training (Sep 2026). Inference reads these; old checkpoints lack them -> defaults False/None.
+            'has_value_head': bool(getattr(model_module, 'use_value_head', False)),
+            'packed_positions': bool(getattr(model_module, 'packed_positions', False)),
+            'loser_move_weight': float(getattr(model_module, 'loser_move_weight', 1.0)),
+            'value_loss_weight': float(getattr(model_module, 'value_loss_weight', 0.0)),
+            'value_mask_prob': float(CHESS_DEFAULTS['value_mask_prob']),
             # Training parameters (can be changed when reloading)
             'batch_size': batch_size,
             'learning_rate': learning_rate if learning_rate is not None else 3e-4,
@@ -1652,11 +1935,54 @@ def save_model_all(model, all_text, n_embd, n_head, n_kv_heads, n_layer, dropout
     # save_token_embeddings(model, os.path.join(model_folder, embedding_filename))
 
 
-def test_progress(epoch, num_epochs, batch_idx, data_loader, loss, model, x, tokens_to_generate, all_text, idx_to_move):
+def _pick_game_from_row(row_tokens, startgame_id, eofg_id, pad_id):
+    """
+    Sep 2026 (game packing): a batch row can hold several games. Return the token list of ONE
+    game: the last complete game (ends with <EOFG>) if there is one, else the first game.
+    """
+    starts = [i for i, t in enumerate(row_tokens) if t == startgame_id]
+    if not starts:
+        # No <STARTGAME> in the row: strip trailing PAD and use everything
+        end = len(row_tokens)
+        while end > 0 and row_tokens[end - 1] == pad_id:
+            end -= 1
+        return row_tokens[:end]
+    segments = []
+    for k, s in enumerate(starts):
+        e = starts[k + 1] if k + 1 < len(starts) else len(row_tokens)
+        seg = row_tokens[s:e]
+        while seg and seg[-1] == pad_id:   # drop PAD tail of the last game
+            seg.pop()
+        segments.append(seg)
+    complete = [seg for seg in segments if seg and seg[-1] == eofg_id]
+    return complete[-1] if complete else segments[0]
+
+
+def _tokens_to_uci_plies(tokens, token_mode, idx_to_move):
+    """Render moves for display: classic -> 'E2E4 E7E5', 4-token -> 'W:e2e4 B:e7e5' (same as generation)."""
+    if token_mode == 'classic':
+        return ' '.join(idx_to_move.get(t, f'<UNK:{t}>') for t in tokens)
+    out, promo_chars = [], ['', 'q', 'r', 'b', 'n']
+    for i in range(0, len(tokens) - 3, 4):
+        c, f, t, p = tokens[i:i + 4]
+        if not (COLOR_OFFSET <= c < FROM_OFFSET and FROM_OFFSET <= f < TO_OFFSET and TO_OFFSET <= t < PROMO_OFFSET):
+            break
+        promo_str = promo_chars[p - PROMO_OFFSET] if PROMO_OFFSET <= p < PROMO_OFFSET + 5 else ''
+        out.append(f"{'W' if c == COLOR_OFFSET else 'B'}:{square_to_uci(f - FROM_OFFSET)}{square_to_uci(t - TO_OFFSET)}{promo_str}")
+    return ' '.join(out)
+
+
+def test_progress(epoch, num_epochs, batch_idx, data_loader, loss, model, x, tokens_to_generate, all_text, idx_to_move, y=None):
     """
     Generate sample chess moves during training to monitor model progress.
 
     Supports both classic (1-token) and 4-token-per-ply generation modes.
+
+    Sep 2026: rows may contain several packed games, so ONE game is unpacked from the row.
+    The first half of that game is the input; the model then predicts moves from there and
+    the actual continuation is printed underneath for comparison. If the model has a value
+    head, its W/D/B prediction for the shown position is printed too. `y` (targets) is
+    optional and only used to recover the true result when the input result was masked <U>.
     """
     print(f"\nEpoch [{epoch+1}/{num_epochs}], Batch [{batch_idx+1}/{len(data_loader)}], Loss: {loss:.4f}")
 
@@ -1668,22 +1994,48 @@ def test_progress(epoch, num_epochs, batch_idx, data_loader, loss, model, x, tok
     model_raw = model_single._orig_mod if hasattr(model_single, '_orig_mod') else model_single
     token_mode = getattr(model_raw, 'token_mode', '4token')
 
-    # Print per-head losses for 4token mode diagnostics
-    if token_mode == '4token':
-        model_raw_diag = model_raw
-        if hasattr(model_raw_diag, '_last_head_losses'):
-            hl = model_raw_diag._last_head_losses
-            print(f"  Head losses -> color: {hl['color']:.4f}  from: {hl['from']:.4f}  to: {hl['to']:.4f}  promo: {hl['promo']:.4f}")
+    # Print per-head losses (4-token: color/from/to/promo/value; classic: value only)
+    if hasattr(model_raw, '_last_head_losses'):
+        hl = model_raw._last_head_losses
+        print("  Head losses -> " + "  ".join(f"{k}: {v:.4f}" for k, v in hl.items()))
+
+    sp = getattr(model_raw, 'special_ids', None) or classic_special_ids()
+    startgame_id, eofg_id, pad_id, u_id = sp['<STARTGAME>'], sp['<EOFG>'], sp['<PAD>'], sp['<U>']
+    result_ids = {sp['<W>'], sp['<D>'], sp['<B>']}
+    block_size = getattr(model_raw, 'block_size', x.shape[-1])
 
     with torch.no_grad():
-        input_seq = x[-1].unsqueeze(0)
-        # Display input sequence using idx_to_move
-        input_seq_str = ' '.join([idx_to_move.get(t.item(), f'<UNK:{t.item()}>') for t in input_seq[0]])
+        dev = x.device
+        row = x[-1].tolist()
+        game = _pick_game_from_row(row, startgame_id, eofg_id, pad_id)
 
+        # True result for the display: from y if the input result token was masked to <U>
+        true_result = game[1] if len(game) > 1 else None
+        if true_result == u_id and y is not None:
+            row_y = y[-1].tolist()
+            # locate this game's <STARTGAME> in the row; y at that index is the true result token
+            for s in range(len(row) - 1, -1, -1):
+                if row[s] == startgame_id and row[s:s + len(game)] == game:
+                    if s < len(row_y) and row_y[s] in result_ids:
+                        true_result = row_y[s]
+                    break
+
+        # Input = header (<STARTGAME> <result>) + first half of the moves, on a ply boundary
+        tokens_per_move = 1 if token_mode == 'classic' else 4
+        body = [t for t in game[2:] if t not in (eofg_id, pad_id)]
+        n_moves = len(body) // tokens_per_move
+        cut = 2 + tokens_per_move * max(1, n_moves // 2)
+        input_tokens = game[:cut]
+        actual_tokens = body[(cut - 2):]
+        input_seq = torch.tensor([input_tokens], dtype=torch.long, device=dev)
+
+        input_seq_str = ' '.join(idx_to_move.get(t, f'<UNK:{t}>') for t in input_tokens)
         print("\nInput Sequence:")
         print(input_seq_str)
 
-        dev = input_seq.device
+        def _append(seq, tok):
+            seq = torch.cat([seq, torch.tensor([[tok]], device=dev)], dim=1)
+            return seq[:, -block_size:] if seq.shape[1] > block_size else seq
 
         if token_mode == 'classic':
             # === CLASSIC MODE: simple autoregressive generation ===
@@ -1691,7 +2043,7 @@ def test_progress(epoch, num_epochs, batch_idx, data_loader, loss, model, x, tok
             num_moves = min(tokens_to_generate, 32)
             # Find special token IDs to skip during generation
             special_ids = set()
-            for name in ['<STARTGAME>', '<EOFG>', '<PAD>', '<W>', '<D>']:
+            for name in CLASSIC_SPECIAL_TOKENS:
                 if name in move_to_idx:
                     special_ids.add(move_to_idx[name])
 
@@ -1704,47 +2056,27 @@ def test_progress(epoch, num_epochs, batch_idx, data_loader, loss, model, x, tok
                 next_tok = next_logits.argmax(dim=-1).item()
                 move_name = idx_to_move.get(next_tok, f'<UNK:{next_tok}>')
                 generated_moves.append(move_name)
-                input_seq = torch.cat([input_seq[:, 1:],
-                                       torch.tensor([[next_tok]], device=dev)], dim=1)
+                input_seq = _append(input_seq, next_tok)
 
             generated_text = ' '.join(generated_moves)
 
         else:
-            # === 4-TOKEN MODE: 4-step role-specific generation (unchanged) ===
+            # === 4-TOKEN MODE: 4-step role-specific generation ===
             generated_moves = []
             num_plies = min(tokens_to_generate, 32)
-
-            # Trim input to last complete ply boundary
-            tokens_list = input_seq[0].tolist()
-            trim_to = len(tokens_list)
-            for j in range(len(tokens_list) - 1, -1, -1):
-                t = tokens_list[j]
-                if (PROMO_OFFSET <= t < PROMO_OFFSET + 5) or t in (STARTGAME, EOFG, W_RESULT, D_RESULT, PAD):
-                    trim_to = j + 1
-                    break
-            if trim_to < len(tokens_list):
-                input_seq = input_seq[:, :trim_to]
-                pad_len = x.shape[-1] - trim_to
-                if pad_len > 0:
-                    padding = torch.full((1, pad_len), PAD, dtype=torch.long, device=dev)
-                    input_seq = torch.cat([padding, input_seq], dim=1)
 
             for _ in range(num_plies):
                 # 1. COLOR prediction
                 output, _ = model_single(input_seq)
                 color_logits = output['color'][0, -1]
                 color_idx = color_logits.argmax(dim=-1).item()
-                color_tok = COLOR_OFFSET + color_idx
-                input_seq = torch.cat([input_seq[:, 1:],
-                                       torch.tensor([[color_tok]], device=dev)], dim=1)
+                input_seq = _append(input_seq, COLOR_OFFSET + color_idx)
 
                 # 2. FROM prediction
                 output, _ = model_single(input_seq)
                 from_logits = output['from'][0, -1]
                 from_sq = from_logits.argmax(dim=-1).item()
-                from_tok = FROM_OFFSET + from_sq
-                input_seq = torch.cat([input_seq[:, 1:],
-                                       torch.tensor([[from_tok]], device=dev)], dim=1)
+                input_seq = _append(input_seq, FROM_OFFSET + from_sq)
 
                 # 3. TO prediction (conditioned on FROM)
                 output, _ = model_single(input_seq)
@@ -1754,17 +2086,13 @@ def test_progress(epoch, num_epochs, batch_idx, data_loader, loss, model, x, tok
                 to_logits = model_raw.head_to(h_conditioned)
                 to_logits[from_sq] = float('-inf')
                 to_sq = to_logits.argmax(dim=-1).item()
-                to_tok = TO_OFFSET + to_sq
-                input_seq = torch.cat([input_seq[:, 1:],
-                                       torch.tensor([[to_tok]], device=dev)], dim=1)
+                input_seq = _append(input_seq, TO_OFFSET + to_sq)
 
                 # 4. PROMO prediction
                 output, _ = model_single(input_seq)
                 promo_logits = output['promo'][0, -1]
                 promo_idx = promo_logits.argmax(dim=-1).item()
-                promo_tok = PROMO_OFFSET + promo_idx
-                input_seq = torch.cat([input_seq[:, 1:],
-                                       torch.tensor([[promo_tok]], device=dev)], dim=1)
+                input_seq = _append(input_seq, PROMO_OFFSET + promo_idx)
 
                 # Reconstruct UCI move string
                 from_str = square_to_uci(from_sq)
@@ -1780,8 +2108,26 @@ def test_progress(epoch, num_epochs, batch_idx, data_loader, loss, model, x, tok
         print("\nGenerated Moves:")
         print(generated_text)
 
+        # Actual continuation from the training game, same format, same length
+        n_show = len(generated_moves) * tokens_per_move
+        actual_text = _tokens_to_uci_plies(actual_tokens[:n_show], token_mode, idx_to_move)
+        print("\nActual Moves:")
+        print(actual_text)
+
+        # Value head: W/D/B prediction for the shown position (result hidden with <U>)
+        value_text = ''
+        if getattr(model_raw, 'use_value_head', False) and len(input_tokens) > 1:
+            probe = list(input_tokens)
+            probe[1] = u_id
+            probs = model_raw.predict_value(torch.tensor([probe], dtype=torch.long, device=dev))[0].tolist()
+            actual_name = idx_to_move.get(true_result, '?') if true_result in result_ids else '?'
+            value_text = f"Value (W/D/B): {probs[0]:.2f} / {probs[1]:.2f} / {probs[2]:.2f}  actual: {actual_name}"
+            print(value_text)
+
         all_text = all_text + ("\nInput Sequence:\n" + input_seq_str +
-                               "\nGenerated Moves:\n" + generated_text)
+                               "\nGenerated Moves:\n" + generated_text +
+                               "\nActual Moves:\n" + actual_text +
+                               ("\n" + value_text if value_text else ""))
 
     if was_training:
         model.train()
@@ -1866,21 +2212,41 @@ def load_model_file(model_file_path=None):
         tokenizer = checkpoint.get('tokenizer')
         if isinstance(tokenizer, dict):
             move_to_idx = tokenizer
-            idx_to_move = {idx: move for move, idx in move_to_idx.items()}
             print(f"Loaded {token_mode} tokenizer with {len(move_to_idx)} tokens")
         elif token_mode == 'classic':
             move_to_idx = create_classic_move_to_idx()
-            idx_to_move = create_classic_idx_to_move(move_to_idx)
             vocab_size = len(move_to_idx)
             print(f"Created fresh classic tokenizer with {len(move_to_idx)} tokens")
         else:
             move_to_idx = create_move_to_idx()
-            idx_to_move = create_idx_to_move()
+
+        # Sep 2026: the vocab grew (<B>, <U>). An older checkpoint is resumed by ALWAYS using the
+        # current vocab and copying the old embedding rows; the new rows start random.
+        # Existing ids are unchanged, so old weights line up exactly.
+        current_vocab = create_classic_move_to_idx() if token_mode == 'classic' else create_move_to_idx()
+        old_vocab_size = vocab_size
+        if len(current_vocab) > len(move_to_idx):
+            print(f"Expanding vocab {len(move_to_idx)} -> {len(current_vocab)} (new result tokens <B>/<U>)")
+            move_to_idx = current_vocab
+            vocab_size = len(current_vocab)
+        idx_to_move = {idx: move for move, idx in move_to_idx.items()}
+
+        # Result-aware flags: old checkpoints have no value head and absolute positions.
+        # The value head is ADDED on resume (random init, trains from here); positions stay as trained.
+        has_value_head = hyperparameters.get('has_value_head', False)
+        packed_positions = hyperparameters.get('packed_positions', False)
+        if not has_value_head:
+            print("Checkpoint has no value head -> adding one (random init)")
+        if not packed_positions:
+            print("Checkpoint uses absolute positions -> game packing disabled for this run")
 
         # Create chess model with correct mode
         print(f"Creating ChessModel in '{token_mode}' mode (vocab_size={vocab_size})")
         model = ChessModel(vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout,
-                           use_chess=True, token_mode=token_mode)
+                           use_chess=True, token_mode=token_mode,
+                           use_value_head=True, packed_positions=packed_positions,
+                           loser_move_weight=hyperparameters.get('loser_move_weight'),
+                           value_loss_weight=hyperparameters.get('value_loss_weight'))
         model.start_game_token = move_to_idx['<STARTGAME>']
 
         # Move model to device before loading state dict
@@ -1899,7 +2265,19 @@ def load_model_file(model_file_path=None):
                 new_key = new_key[len('_orig_mod.'):]
             cleaned_state_dict[new_key] = val
 
-        model.load_state_dict(cleaned_state_dict, strict=False)
+        # Vocab expansion: copy the old embedding rows into the (larger) new table
+        if vocab_size > old_vocab_size:
+            for key in ('token_embedding_table.weight', 'lm_head.weight'):
+                if key in cleaned_state_dict and cleaned_state_dict[key].shape[0] == old_vocab_size:
+                    new_w = model.state_dict()[key].clone()
+                    new_w[:old_vocab_size] = cleaned_state_dict[key].to(new_w.device)
+                    cleaned_state_dict[key] = new_w
+
+        missing, unexpected = model.load_state_dict(cleaned_state_dict, strict=False)
+        if missing:
+            print(f"State dict: {len(missing)} new parameter tensors initialised fresh: {missing}")
+        if unexpected:
+            print(f"State dict: {len(unexpected)} unexpected keys ignored: {unexpected}")
 
         # NOTE: torch.compile is applied LATER in _train_chess_model_core after GPU setup
         # Do NOT apply torch.compile here - it breaks .parameters() and .state_dict() access
@@ -2021,7 +2399,15 @@ def enter_batch_size(n_embd, n_head, block_size, n_layer, batch_size, gpu_indice
         per_gpu_free = 64 * 1024**3
 
     per_gpu_available = per_gpu_free * 0.90 - static_per_gpu  # 90% of free, minus static
-    max_seqs_per_gpu = max(1, int(per_gpu_available / total_per_seq))
+    # GB10: "free" is leftover system RAM. Desktop is already in the used slice — only
+    # keep UNIFIED_HEADROOM_BYTES of the free pool so compile/GUI spikes cannot freeze it.
+    unified = _uses_unified_memory()
+    if unified:
+        usable = max(0.0, per_gpu_free - UNIFIED_HEADROOM_BYTES)
+        per_gpu_available = usable * 0.85 - static_per_gpu
+        print(f"    Unified memory: keeping {UNIFIED_HEADROOM_BYTES/2**30:.0f} GB of current free RAM unused")
+
+    max_seqs_per_gpu = max(1, int(per_gpu_available / total_per_seq)) if per_gpu_available > 0 else 1
     max_batch_size = max_seqs_per_gpu * num_gpus
 
     print(f"\n  Memory estimate:")
@@ -2031,8 +2417,12 @@ def enter_batch_size(n_embd, n_head, block_size, n_layer, batch_size, gpu_indice
     print(f"    Available for activations: {per_gpu_available / 1e9:.1f} GB")
     print(f"    Max batch size: {max_batch_size} ({max_seqs_per_gpu} per GPU x {num_gpus} GPUs)")
 
-    # Recommend 75% of max for safety
+    # Recommend 75% of max for safety (same on GB10; 16GB free headroom is the freeze guard)
     recommended_batch = max(1, (max_batch_size * 3 // 4))
+    if unified:
+        print(f"    GB10: recommended {recommended_batch} of max {max_batch_size} "
+              f"(~{(static_per_gpu + recommended_batch * total_per_seq)/1e9:.0f} GB train, "
+              f"{UNIFIED_HEADROOM_BYTES/2**30:.0f} GB kept free)")
     # Round down to nearest multiple of num_gpus for even splits
     recommended_batch = (recommended_batch // num_gpus) * num_gpus
     recommended_batch = max(num_gpus, recommended_batch)
@@ -2049,6 +2439,8 @@ idx_to_move = create_idx_to_move()
 
 
 def _ddp_setup(rank, world_size):
+    # NCCL = NVIDIA multi-GPU only (Ubuntu/Spark). Will not run on Mac/MPS or non-NVIDIA.
+    # Single-GPU path skips this entirely via _single_gpu_train.
     """Initialize the distributed process group for DDP training."""
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '29500'
@@ -2067,7 +2459,7 @@ def _ddp_cleanup():
 
 # Core training function — DDP multi-GPU version
 # Uses mp.spawn + DistributedDataParallel for true parallel GPU training.
-# Launch: python Chess_Brain_mp_spawn_4_12_26.py  (no torchrun needed)
+# Launch: python Chess_Brain_mp_spawn_9_20_26.py  (no torchrun needed)
 
 def _handle_training_interrupt(dataset, block_size, move_to_idx, current_lr=None, token_mode='4token'):
     """Handle Ctrl+C during training. Returns dict with 'dataset' and 'lr' keys, or None to quit."""
@@ -2116,9 +2508,14 @@ def _handle_training_interrupt(dataset, block_size, move_to_idx, current_lr=None
             print(f"New dataset loaded. Games: {len(games)}, Characters: {len(text)}")
 
             if token_mode == 'classic':
-                result['dataset'] = ClassicChessMovesDataset(text, block_size, move_to_idx)
+                _tmp_ds = ClassicChessMovesDataset(text, block_size, move_to_idx)
+                _tmp_roles = None
             else:
-                result['dataset'] = ChessMovesDataset(text, block_size, move_to_idx)
+                _tmp_ds = ChessMovesDataset(text, block_size, move_to_idx)
+                _tmp_roles = _tmp_ds.roles_tensor
+            # Wrap in _PreTokenizedDataset so game packing + <U> masking apply here too (Sep 2026)
+            result['dataset'] = _PreTokenizedDataset(_tmp_ds.tokens_tensor, _tmp_roles, block_size, token_mode, move_to_idx)
+            del _tmp_ds
             print(f"New dataset: {len(result['dataset'])} sequences ({token_mode} mode)")
 
     if result['dataset'] is None and result['lr'] is None:
@@ -2199,7 +2596,8 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
 
         # Create model on this GPU
         model = ChessModel(vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout,
-                           use_chess=True, token_mode=token_mode)
+                           use_chess=True, token_mode=token_mode,
+                           packed_positions=model_args.get('packed_positions', True))  # Sep 2026
         model.start_game_token = move_to_idx['<STARTGAME>']
 
         # Load checkpoint weights if resuming
@@ -2275,7 +2673,9 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
             scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs)
 
         # Dataset from pre-tokenized shared-memory tensors (no re-tokenization)
-        dataset = _PreTokenizedDataset(tokens_tensor, roles_tensor, block_size, token_mode, move_to_idx)
+        # Sep 2026: game packing only when the model uses per-game positions
+        dataset = _PreTokenizedDataset(tokens_tensor, roles_tensor, block_size, token_mode, move_to_idx,
+                                       pack_games=model.module.packed_positions, verbose=(rank == 0))
 
         if rank == 0:
             print(f"Dataset: {len(dataset)} sequences ({token_mode} mode)")
@@ -2312,12 +2712,8 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
             sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
             sampler.set_epoch(epoch)
 
-            num_workers = min(8, os.cpu_count() // max(world_size, 1))
             data_loader = DataLoader(
-                dataset, batch_size=batch_size // world_size, sampler=sampler,
-                drop_last=True, num_workers=num_workers,
-                pin_memory=True, persistent_workers=(num_workers > 0),
-                prefetch_factor=4 if num_workers > 0 else None
+                dataset, **_dataloader_kwargs(batch_size // world_size, sampler=sampler)
             )
 
             if rank == 0:
@@ -2360,8 +2756,8 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
                     model_raw = model.module
                     if hasattr(model_raw, '_last_head_losses'):
                         hl = model_raw._last_head_losses
-                        print(f"  Head losses -> color: {hl['color']:.4f}  from: {hl['from']:.4f}  "
-                              f"to: {hl['to']:.4f}  promo: {hl['promo']:.4f}")
+                        # Classic mode only has 'value'; 4-token has all heads (Sep 2026)
+                        print("  Head losses -> " + "  ".join(f"{k}: {v:.4f}" for k, v in hl.items()))
 
                     # Plateau detection
                     if scheduler_choice == 'plateau':
@@ -2390,7 +2786,7 @@ def _ddp_train_worker(rank, world_size, gpu_indices, train_args):
                     # Generate sample moves
                     all_text = test_progress(
                         epoch, num_epochs, batch_idx, data_loader, avg_loss,
-                        model.module, x, 50, all_text, idx_to_move
+                        model.module, x, 50, all_text, idx_to_move, y=y   # y: true result for the value line (Sep 2026)
                     )
 
                     # Save checkpoint — rank 0 only, using model.module (unwrapped)
@@ -2708,6 +3104,8 @@ def _train_chess_model_core(text, checkpoint_data=None, token_mode='4token'):
                 return [_to_cpu(v) for v in obj]
             return obj
 
+        # Sep 2026: keep the position scheme the checkpoint was trained with (see load_model_file)
+        packed_positions = bool(getattr(model, 'packed_positions', False))
         cpu_state = _to_cpu(model.state_dict())
         cpu_opt = optimizer_state_dict
         if isinstance(cpu_opt, list):
@@ -2724,12 +3122,15 @@ def _train_chess_model_core(text, checkpoint_data=None, token_mode='4token'):
         start_epoch = 0
         start_batch = 0
         checkpoint_dict = None
+        packed_positions = True   # Sep 2026: new models use per-game positions + game packing
 
         n_embd = int(get_input_with_default("Embedding dimensions", CHESS_DEFAULTS['n_embd']))
         n_head = int(get_input_with_default("Number of query heads", CHESS_DEFAULTS['n_head']))
         n_kv_heads = int(get_input_with_default("Number of KV heads", CHESS_DEFAULTS['n_kv_heads']))
+        # Classic 1 token/ply: 512 covers ~99.5% of Stockfish games (256 still cut ~20%).
+        # 4-token uses CHESS_DEFAULTS['block_size'] (1536 = 384 plies, ~97%).
         block_size = int(get_input_with_default("Sequence length",
-                                                 128 if token_mode == 'classic' else CHESS_DEFAULTS['block_size']))
+                                                 512 if token_mode == 'classic' else CHESS_DEFAULTS['block_size']))
         n_layer = int(get_input_with_default("Number of layers", CHESS_DEFAULTS['n_layer']))
         dropout = float(get_input_with_default("Dropout", CHESS_DEFAULTS['dropout']))
         num_epochs = int(get_input_with_default("Number of epochs", CHESS_DEFAULTS['num_epochs']))
@@ -2793,6 +3194,7 @@ def _train_chess_model_core(text, checkpoint_data=None, token_mode='4token'):
         'n_embd': n_embd, 'n_head': n_head, 'n_kv_heads': n_kv_heads,
         'block_size': block_size, 'n_layer': n_layer, 'dropout': dropout,
         'vocab_size': vocab_size,
+        'packed_positions': packed_positions,   # Sep 2026: per-game positions / game packing on-off
     }
     training_params = {
         'batch_size': batch_size, 'num_epochs': num_epochs,
@@ -2882,7 +3284,8 @@ def _single_gpu_train(gpu_id, train_args):
 
     # Create model
     model = ChessModel(vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout,
-                       use_chess=True, token_mode=token_mode)
+                       use_chess=True, token_mode=token_mode,
+                       packed_positions=model_args.get('packed_positions', True))  # Sep 2026
     model.start_game_token = move_to_idx['<STARTGAME>']
 
     if checkpoint_data is not None:
@@ -2910,10 +3313,22 @@ def _single_gpu_train(gpu_id, train_args):
     if not os.environ.get('CHESS_NO_COMPILE') and hasattr(torch, 'compile'):
         try:
             print("Enabling torch.compile()...")
-            model = torch.compile(model, mode='reduce-overhead')
+            _eager_model = model
+            model = torch.compile(model, mode='default')  # not reduce-overhead: CUDA graphs hold extra RAM and can freeze GB10
+            # torch.compile is lazy: the Triton kernels are only built on the first forward.
+            # Warm up here so a broken backend (e.g. ptxas without this GPU's sm_xxx) falls back
+            # to eager instead of crashing the first training batch. (Sep 2026)
+            with torch.no_grad():
+                # Warm up at real sequence length — T=8 hid the 1024-mask vs 1536 crash
+                _warm_t = min(int(getattr(_eager_model, 'block_size', 128)), 256)
+                _warm = torch.full((2, _warm_t), move_to_idx['<STARTGAME>'], dtype=torch.long, device=device)
+                model(_warm)
             print("torch.compile() enabled")
         except Exception as e:
-            print(f"torch.compile() failed: {e}, continuing without")
+            print(f"torch.compile() failed: {str(e).strip().splitlines()[-1][:200]}")
+            print("Continuing without torch.compile (set CHESS_NO_COMPILE=1 to skip the attempt)")
+            model = _eager_model
+            torch._dynamo.reset()
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Model: {num_params:,} parameters, single GPU")
@@ -2966,7 +3381,9 @@ def _single_gpu_train(gpu_id, train_args):
     scaler = GradScaler()
 
     # Dataset from pre-tokenized tensors (tokenized once in _train_chess_model_core)
-    dataset = _PreTokenizedDataset(tokens_tensor, roles_tensor, block_size, token_mode, move_to_idx)
+    # Sep 2026: game packing only when the model uses per-game positions
+    dataset = _PreTokenizedDataset(tokens_tensor, roles_tensor, block_size, token_mode, move_to_idx,
+                                   pack_games=getattr(model, '_orig_mod', model).packed_positions)
     print(f"Dataset: {len(dataset)} sequences ({token_mode} mode)")
 
     # Ctrl+C handler
@@ -2988,18 +3405,13 @@ def _single_gpu_train(gpu_id, train_args):
     plateau_check_counter = 0
     previous_plateau_avg = None
 
-    num_workers = min(8, os.cpu_count() // 2)
-
     epoch = start_epoch
     while epoch < num_epochs:
         epoch_loss = 0.0
         epoch_batches = 0
 
         data_loader = DataLoader(
-            dataset, batch_size=batch_size, shuffle=True, drop_last=True,
-            num_workers=num_workers, pin_memory=True,
-            persistent_workers=(num_workers > 0),
-            prefetch_factor=2 if num_workers > 0 else None
+            dataset, **_dataloader_kwargs(batch_size)
         )
         print(f"Epoch {epoch+1}/{num_epochs}, {len(data_loader)} batches")
 
@@ -3035,6 +3447,7 @@ def _single_gpu_train(gpu_id, train_args):
             epoch_batches += 1
 
             current_batch_x = x
+            current_batch_y = y   # for test_progress value line (Sep 2026)
 
             del output, loss, x, y, y_roles
             if is_blackwell_gpu:
@@ -3071,7 +3484,7 @@ def _single_gpu_train(gpu_id, train_args):
 
                 all_text = test_progress(
                     epoch, num_epochs, batch_idx, data_loader, loss_val,
-                    model, current_batch_x, 50, all_text, idx_to_move
+                    model, current_batch_x, 50, all_text, idx_to_move, y=current_batch_y
                 )
 
                 save_model_all(

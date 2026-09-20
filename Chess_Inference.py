@@ -1,29 +1,27 @@
 """
-ChessBrain Inference Engine
+ChessBrain Inference Engine — Chess_Inference.py (Sept 20, 2026)
 
-Specialized inference engine for chess move prediction using transformer models.
-Supports coordinate notation chess moves with optimized MobileLLM architecture.
+Loads `.pth` checkpoints from Chess_Brain_mp_spawn_9_20_26.py (and older trainers)
+and generates UCI moves for Chess_9_20_26.py. No dependency on the training script.
 
-Key Features:
-- Chess move tokenization (coordinate notation)
-- Support for both basic and optimized model architectures
-- Game boundary masking for proper chess game handling (MobileLLM)
-- Top-k sampling for diverse move generation
-- Integration with ChessBrain training system
+CURRENT FORMAT (result-aware, Sept 20, 2026) — what changed vs older inference:
+- Classic (1 token/move) OR 4-token (COLOR/FROM/TO/PROMO) auto-detected from checkpoint
+- Vocab extended: `<B>` (black won) and `<U>` (unknown result) — 4-token vocab 142;
+  classic specials grow after the fixed 20,160 move tokens (old ids unchanged)
+- Prompt side: GUI builds `<STARTGAME> <W|B> moves…` so Neural plays like the winner
+  (`build_history_prompt` / RESULT_TOKEN_FOR_SIDE)
+- Optional value head: 3-way W/D/B; GUI may re-rank legal candidates via `rerank_by_value`
+- Optional packed_positions: position ids restart at each `<STARTGAME>` (game packing)
+- Device: CPU by default (DGX checkpoint → Mac/Linux play). Override with CHESS_DEVICE=mps|cuda
 
-Supported Architectures:
-- TransformerModel: Standard GPT-style transformer
-- MobileLLMModel: Memory-efficient with RMSNorm, MultiQueryAttention, SwiGLU
+Still supported (legacy):
+- Older ChessModel checkpoints without value head / packing
+- Very old TransformerModel / MobileLLMModel weights (kept for load compatibility)
 
-Usage:
-- ChessBrain Integration: Called by training scripts for progress monitoring
-- API: Use generate_response() function programmatically for chess moves
+Architecture (current ChessModel): RMSNorm, MultiQueryAttention (GQA), SwiGLU, game masks.
 
-Version History:
-- Sep 24, 2024: Added separate chess moves tokenizer
-- Sep 26, 2024: Mac compatibility and latest file selection
-- Nov 20, 2024: MobileLLM architecture integration
-- Nov 22, 2024: Support for both basic and optimized chess models
+API: initialize_model / generate_response / generate_candidates / build_history_prompt /
+     rerank_by_value — used by the Pygame GUI and by the trainer’s sample dumps.
 """
 
 import sys
@@ -35,8 +33,19 @@ import os
 
 # Device configuration for inference
 # For performance: CUDA > MPS > CPU
-# For debugging/development: Force CPU to avoid GPU memory issues
-device = torch.device('cpu')
+# Sept 20, 2026: CPU by default so a checkpoint trained on the DGX plays on any Mac with just
+# `pip install torch pygame`. Set CHESS_DEVICE=mps (Apple GPU) or CHESS_DEVICE=cuda to opt in.
+def _select_inference_device():
+    want = os.environ.get('CHESS_DEVICE', 'cpu').lower()
+    if want == 'mps' and torch.backends.mps.is_available():
+        return torch.device('mps')
+    if want == 'cuda' and torch.cuda.is_available():
+        return torch.device('cuda')
+    if want not in ('cpu', 'mps', 'cuda'):
+        print(f"CHESS_DEVICE={want!r} not recognised, using cpu")
+    return torch.device('cpu')
+
+device = _select_inference_device()
 
 # Global state for chess inference API usage
 # These persist across function calls for efficiency
@@ -45,6 +54,13 @@ global_tokenizer = None      # Chess move tokenizer (dict)
 global_tokenizer_reverse = None # Reverse mapping for move decoding
 global_use_characters = False  # Chess-only: no character-level tokenization
 global_use_chess_moves = True  # Chess-only: use coordinate notation
+
+# =============================================================================================
+# LEGACY CHECKPOINT SUPPORT
+# TransformerModel / MobileLLMModel (and their building blocks) are kept so that very old
+# checkpoints still load. Current checkpoints use ChessModel further below. RMSNorm,
+# MultiQueryAttention, SwiGLU and Block are shared with ChessModel.
+# =============================================================================================
 
 class MultiHeadAttention(nn.Module):
     """
@@ -345,7 +361,7 @@ class MultiQueryAttention(nn.Module):
         self.k_norm = RMSNorm(head_dim)
 
         self.dropout = nn.Dropout(dropout)
-        self.register_buffer('causal_mask', torch.tril(torch.ones(1024, 1024)))
+        # Causal mask is built from T each forward (fixed 1024 buffer broke block_size 1536)
         self.flash_available = hasattr(F, 'scaled_dot_product_attention')
         if self.flash_available:
             print("Using Flash Attention in MultiQueryAttention")
@@ -370,36 +386,26 @@ class MultiQueryAttention(nn.Module):
         v = v.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
 
         if self.flash_available:
-            # Prepare masks
-            causal_mask = self.causal_mask[:T, :T].bool()  # Shape: [T, T]
             if mask is not None:
-                game_mask = mask[:, :T, :T].bool()  # Shape: [B, T, T]
-                combined_mask = torch.logical_and(
-                    causal_mask.unsqueeze(0),  # Shape: [1, T, T]
-                    game_mask  # Shape: [B, T, T]
-                )  # Resulting shape: [B, T, T]
+                causal = torch.ones(T, T, dtype=torch.bool, device=x.device).tril()
+                combined_mask = causal.unsqueeze(0) & mask[:, :T, :T].bool()
+                y = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=combined_mask.unsqueeze(1),
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    is_causal=False
+                )
             else:
-                combined_mask = causal_mask.unsqueeze(0)  # Shape: [1, T, T]
-
-            # Unsqueeze to add the num_heads dimension
-            attention_mask = combined_mask.unsqueeze(1)  # Shape: [B, 1, T, T]
-
-            # Use flash attention with the correctly shaped mask
-            y = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attention_mask,  # Shape: [B, 1, T, T]
-                dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal=False  # We're handling causality in our mask
-            )
+                y = F.scaled_dot_product_attention(
+                    q, k, v,
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    is_causal=True
+                )
         else:
             # Traditional attention (fallback if flash attention is unavailable)
-            # Compute attention scores
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-
-            # Apply causal masking
-            causal_mask = self.causal_mask[:T, :T].unsqueeze(0).unsqueeze(1)  # Shape: [1, 1, T, T]
-            causal_mask = causal_mask.expand(B, self.n_heads, T, T)  # Expand to batch and heads
-            att = att.masked_fill(causal_mask == 0, float('-inf'))
+            causal = torch.ones(T, T, device=x.device).tril()
+            att = att.masked_fill(causal == 0, float('-inf'))
 
             # Apply additional mask if provided
             if mask is not None:
@@ -554,18 +560,57 @@ class MobileLLMModel(nn.Module):
 ChessBlock = Block
 
 
+# =============================================================================================
+# CURRENT CHECKPOINT FORMAT (Chess_Brain_mp_spawn_9_20_26.py, result-aware, Sept 20, 2026)
+# Vocab / special-token constants. Must match the training script exactly.
+# =============================================================================================
+# === Role-specific 4-token-per-ply constants ===
+ROLE_COLOR = 0; ROLE_FROM = 1; ROLE_TO = 2; ROLE_PROMO = 3; ROLE_SPECIAL = -1
+COLOR_OFFSET = 0; FROM_OFFSET = 2; TO_OFFSET = 66; PROMO_OFFSET = 130
+STARTGAME = 135; EOFG = 136; PAD = 137; W_RESULT = 138; D_RESULT = 139
+B_RESULT = 140   # <B> black won (Sept 20, 2026; 0-1 used to be lumped into <D>)
+U_RESULT = 141   # <U> unknown result -> value head must predict the outcome
+ROLE_VOCAB_SIZE = 142
+
+# Special tokens shared by both modes. Classic ids are fixed offsets after the 20,160 move tokens,
+# so <STARTGAME>..<D> match old 20,165-token checkpoints and <B>,<U> extend them.
+CLASSIC_SPECIAL_TOKENS = ['<STARTGAME>', '<EOFG>', '<PAD>', '<W>', '<D>', '<B>', '<U>']
+CLASSIC_MOVE_TOKENS = 64 * 63 * 5
+RESULT_TOKEN_FOR_SIDE = {'W': '<W>', 'B': '<B>'}   # "play like the winner" prompt token per side
+VALUE_CLASS = {'W': 0, 'D': 1, 'B': 2}             # value head output order
+
+
+def classic_special_ids():
+    return {name: CLASSIC_MOVE_TOKENS + i for i, name in enumerate(CLASSIC_SPECIAL_TOKENS)}
+
+
+def role_special_ids():
+    return {'<STARTGAME>': STARTGAME, '<EOFG>': EOFG, '<PAD>': PAD,
+            '<W>': W_RESULT, '<D>': D_RESULT, '<B>': B_RESULT, '<U>': U_RESULT}
+
+
 class ChessModel(nn.Module):
     """
     Chess move prediction transformer (inference-only copy, no Chess_Brain dependency).
     Supports both classic (single lm_head) and 4-token (role-specific heads) modes.
+
+    Sept 20, 2026 additions (must mirror Chess_Brain_mp_spawn_9_20_26.py):
+    - packed_positions: position ids restart at every <STARTGAME> (models trained with game packing)
+    - use_value_head: extra 3-way head predicting the game result (W/D/B) from the moves so far
+    Older checkpoints without these still load (flags false / head absent).
     """
-    def __init__(self, vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout, use_chess=False, use_dna=False, token_mode='4token'):
+    def __init__(self, vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout,
+                 use_chess=True, use_dna=False, token_mode='4token',
+                 use_value_head=False, packed_positions=False, start_game_token=None):
         super().__init__()
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.use_chess = use_chess
         self.token_mode = token_mode
-        self.start_game_token = None
+        self.use_value_head = use_value_head
+        self.packed_positions = packed_positions
+        self.special_ids = classic_special_ids() if token_mode == 'classic' else role_special_ids()
+        self.start_game_token = self.special_ids['<STARTGAME>'] if start_game_token is None else start_game_token
 
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
@@ -587,33 +632,55 @@ class ChessModel(nn.Module):
             self.head_promo = nn.Linear(n_embd, 5)
             self.emb_from = nn.Embedding(64, n_embd)
 
+        if use_value_head:
+            self.head_value = nn.Linear(n_embd, 3)   # logits over (W, D, B)
+
     def create_game_mask(self, idx):
         if not self.use_chess or self.start_game_token is None:
             return None
         game_boundaries = (idx == self.start_game_token).float().cumsum(dim=1)
         return (game_boundaries.unsqueeze(1) == game_boundaries.unsqueeze(2)).float()
 
-    def forward(self, idx, targets=None, target_roles=None):
+    def game_start_index(self, idx):
+        """Index of the most recent <STARTGAME> at or before each position (0 if none)."""
+        B, T = idx.shape
+        t = torch.arange(T, device=idx.device).unsqueeze(0).expand(B, T)
+        return torch.where(idx == self.start_game_token, t, torch.zeros_like(t)).cummax(dim=1).values
+
+    def _backbone(self, idx):
         B, T = idx.shape
         tok_emb = self.token_embedding_table(idx)
-        pos_emb = self.position_embedding_table(self.pos_indices[:T])
+        if self.packed_positions and self.use_chess:
+            pos_ids = (self.pos_indices[:T].unsqueeze(0) - self.game_start_index(idx)).clamp(0, self.block_size - 1)
+            pos_emb = self.position_embedding_table(pos_ids)
+        else:
+            pos_emb = self.position_embedding_table(self.pos_indices[:T])
         x = tok_emb + pos_emb
-
         game_mask = self.create_game_mask(idx)
         for block in self.blocks:
             x = block(x, mask=game_mask)
+        return self.rms_final(x)
 
-        x = self.rms_final(x)
-
+    def forward(self, idx, targets=None, target_roles=None):
+        x = self._backbone(idx)
         if self.token_mode == 'classic':
-            logits = self.lm_head(x)
-            return logits, None
-        else:
-            return x, None
+            return self.lm_head(x), None
+        out = {'hidden': x, 'color': self.head_color(x), 'from': self.head_from(x), 'promo': self.head_promo(x)}
+        if self.use_value_head:
+            out['value'] = self.head_value(x)
+        return out, None
+
+    @torch.no_grad()
+    def predict_value(self, idx):
+        """Softmax over (W, D, B) at the last position of each row. Prompt should start <STARTGAME> <U>."""
+        if not self.use_value_head:
+            return None
+        h = self._backbone(idx)
+        return F.softmax(self.head_value(h[:, -1]), dim=-1)
 
 
 def create_classic_move_to_idx():
-    """Create classic ~20K vocab: 64*63*5 move tokens + 5 special."""
+    """Create classic ~20K vocab: 64*63*5 move tokens + special tokens (7 since Sept 20, 2026: +<B>,<U>)."""
     m = {}
     for from_sq in range(64):
         from_file = chr(97 + (from_sq % 8))
@@ -628,7 +695,7 @@ def create_classic_move_to_idx():
                 move_id = (from_sq * 63 * 5) + (to_offset * 5) + promo_idx
                 move_str = f"{from_file}{from_rank}{to_file}{to_rank}{promo_char}".upper()
                 m[move_str] = move_id
-    for idx, token in enumerate(['<STARTGAME>', '<EOFG>', '<PAD>', '<W>', '<D>'], start=len(m)):
+    for idx, token in enumerate(CLASSIC_SPECIAL_TOKENS, start=len(m)):
         m[token] = idx
     return m
 
@@ -636,13 +703,6 @@ def create_classic_move_to_idx():
 def create_classic_idx_to_move(classic_move_to_idx):
     """Reverse mapping for classic tokenizer."""
     return {idx: move for move, idx in classic_move_to_idx.items()}
-
-
-# === Role-specific 4-token-per-ply constants (must match Chess_Brain_WB_2_12_26.py) ===
-ROLE_COLOR = 0; ROLE_FROM = 1; ROLE_TO = 2; ROLE_PROMO = 3; ROLE_SPECIAL = -1
-COLOR_OFFSET = 0; FROM_OFFSET = 2; TO_OFFSET = 66; PROMO_OFFSET = 130
-STARTGAME = 135; EOFG = 136; PAD = 137; W_RESULT = 138; D_RESULT = 139
-ROLE_VOCAB_SIZE = 140
 
 
 def uci_to_square(file_char, rank_char):
@@ -666,6 +726,7 @@ def parse_uci_move(move_str, is_white):
 
 
 def create_move_to_idx():
+    """4-token vocab (142 tokens since Sept 20, 2026: added <B> and <U>)."""
     m = {}
     m['<WHITE>'] = 0; m['<BLACK>'] = 1
     for sq in range(64):
@@ -673,460 +734,403 @@ def create_move_to_idx():
         m[f'T:{square_to_uci(sq)}'] = TO_OFFSET + sq
     for i, l in enumerate(['none', 'q', 'r', 'b', 'n']):
         m[f'<PROMO:{l}>'] = PROMO_OFFSET + i
-    m['<STARTGAME>'] = STARTGAME; m['<EOFG>'] = EOFG; m['<PAD>'] = PAD
-    m['<W>'] = W_RESULT; m['<D>'] = D_RESULT
+    m.update(role_special_ids())
     return m
 
 move_to_idx = create_move_to_idx()
+
+
+def _clean_state_dict_keys(state_dict):
+    """Strip DataParallel / torch.compile wrapper prefixes from checkpoint keys."""
+    cleaned = {}
+    for k, v in state_dict.items():
+        nk = k
+        if nk.startswith('module.'):
+            nk = nk[len('module.'):]
+        if nk.startswith('_orig_mod.module.'):
+            nk = nk[len('_orig_mod.module.'):]
+        elif nk.startswith('_orig_mod.'):
+            nk = nk[len('_orig_mod.'):]
+        cleaned[nk] = v
+    return cleaned
 
 
 def load_model_file(checkpoint_path=None):
     """
     Load and initialize a trained chess transformer model from checkpoint.
 
-    Automatically detects model architecture from checkpoint metadata.
-    Supports both basic and optimized chess move prediction models.
+    Everything the GUI needs is read from the checkpoint and attached to the model object
+    (so two models of different modes can be loaded for White and Black at the same time):
+        model._token_mode        'classic' | '4token'
+        model._tokenizer         name -> id dict actually used for training
+        model._tokenizer_reverse id -> name
+        model._block_size
+        model._has_value_head    True when the checkpoint has the W/D/B value head
+        model._special_ids       special-token ids for this mode
 
-    Model Detection Logic:
-    1. Load checkpoint and examine hyperparameters
-    2. Check for MobileLLM-specific layers (RMSNorm, SwiGLU, etc.)
-    3. Load appropriate chess model architecture
-    4. Load chess tokenizer and model weights
-    5. Handle DataParallel/torch.compile prefix handling
-
-    Supported Architectures:
-    - TransformerModel: Standard GPT-style transformer for chess
-    - MobileLLMModel: Memory-efficient with RMSNorm, MultiQueryAttention, SwiGLU
+    Checkpoint hyperparameters honoured (old checkpoints simply lack the new keys):
+        vocab_size, n_embd, n_head, n_kv_heads, n_layer, dropout, block_size, token_mode,
+        has_value_head (default False), packed_positions (default False)
 
     Args:
         checkpoint_path: Path to a .pth checkpoint (required; no GUI dialog in this module).
 
     Returns:
         Tuple: (model, vocab_size, n_embd, n_head, block_size, n_layer, dropout, tokenizer)
+        or eight Nones on failure.
     """
+    NONE8 = (None,) * 8
     try:
         if not checkpoint_path or not os.path.isfile(checkpoint_path):
-            if checkpoint_path:
-                print(f"Checkpoint not found: {checkpoint_path}")
-            else:
-                print("load_model_file: checkpoint_path is required.")
-            return None, None, None, None, None, None, None, None
+            print(f"Checkpoint not found: {checkpoint_path}" if checkpoint_path else "load_model_file: checkpoint_path is required.")
+            return NONE8
 
-        model_file = checkpoint_path
+        # map_location='cpu' keeps DGX-trained checkpoints loadable on a Mac
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        hyperparameters = checkpoint['hyperparameters']
+        state_dict = _clean_state_dict_keys(checkpoint['model_state_dict'])
 
-        if model_file:
-            checkpoint = torch.load(model_file, map_location="cpu")
-            hyperparameters = checkpoint['hyperparameters']
-            state_dict = checkpoint['model_state_dict']
-            
-            # Extract hyperparameters with fallbacks
-            vocab_size = hyperparameters['vocab_size']
-            n_embd = hyperparameters['n_embd']
-            n_head = hyperparameters['n_head']
-            n_layer = hyperparameters['n_layer']
-            dropout = hyperparameters['dropout']
-            block_size = hyperparameters['block_size']
-            
-            # Determine model architecture based on checkpoint contents
-            fmt_version = hyperparameters.get('format_version', 1)
-            token_mode = hyperparameters.get('token_mode', '4token')
-            has_role_heads = any('head_color' in key for key in state_dict.keys())
-            has_lm_head = any('lm_head' in key for key in state_dict.keys())
-            has_factorized_heads = any('from_head' in key for key in state_dict.keys())
-            has_mobile_llm_features = any('rms_1' in key or 'swiglu' in key for key in state_dict.keys())
+        vocab_size = hyperparameters['vocab_size']
+        n_embd = hyperparameters['n_embd']
+        n_head = hyperparameters['n_head']
+        n_layer = hyperparameters['n_layer']
+        dropout = hyperparameters['dropout']
+        block_size = hyperparameters['block_size']
+        n_kv_heads = hyperparameters.get('n_kv_heads', n_head // 4)
 
-            # ChessModel, create_classic_move_to_idx, create_classic_idx_to_move
-            # are defined above in this file (no Chess_Brain dependency needed at inference)
+        fmt_version = hyperparameters.get('format_version', 1)
+        token_mode = hyperparameters.get('token_mode', '4token')
+        has_role_heads = any('head_color' in key for key in state_dict)
+        has_lm_head = any('lm_head' in key for key in state_dict)
+        has_factorized_heads = any('from_head' in key for key in state_dict)
+        has_mobile_llm_features = any('rms_1' in key or 'swiglu' in key for key in state_dict)
+        # Sept 20, 2026 fields; fall back to inspecting weights for checkpoints saved without them
+        has_value_head = bool(hyperparameters.get('has_value_head', 'head_value.weight' in state_dict))
+        packed_positions = bool(hyperparameters.get('packed_positions', False))
 
-            # Classic mode: format_version 3, or has lm_head + rms blocks
-            if token_mode == 'classic' or (fmt_version >= 3 and has_lm_head):
-                token_mode = 'classic'
-                print(f"Loading ChessModel (classic 1-token mode, vocab={vocab_size})...")
-                n_kv_heads = hyperparameters.get('n_kv_heads', n_head // 4)
+        tokenizer = checkpoint.get('tokenizer') if isinstance(checkpoint.get('tokenizer'), dict) else None
 
-                model = ChessModel(
-                    vocab_size=vocab_size,
-                    n_embd=n_embd,
-                    n_head=n_head,
-                    n_kv_heads=n_kv_heads,
-                    block_size=block_size,
-                    n_layer=n_layer,
-                    dropout=dropout,
-                    use_chess=True,
-                    token_mode='classic'
-                )
+        if token_mode == 'classic' or (fmt_version >= 3 and has_lm_head and has_mobile_llm_features):
+            token_mode = 'classic'
+            if tokenizer is None:
+                tokenizer = create_classic_move_to_idx()
+            print(f"Loading ChessModel (classic 1-token mode, vocab={vocab_size}, value_head={has_value_head}, packed={packed_positions})...")
+            model = ChessModel(vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout,
+                               use_chess=True, token_mode='classic',
+                               use_value_head=has_value_head, packed_positions=packed_positions,
+                               start_game_token=tokenizer.get('<STARTGAME>'))
 
-                # Use checkpoint tokenizer if available, otherwise create fresh
-                tokenizer = checkpoint.get('tokenizer')
-                if not isinstance(tokenizer, dict):
-                    tokenizer = create_classic_move_to_idx()
-                # Update global move_to_idx for tokenization
+        elif has_role_heads or fmt_version >= 2:
+            token_mode = '4token'
+            if tokenizer is None:
+                # Old 4-token checkpoints (140 tokens) saved no tokenizer: rebuild and trim to vocab_size
+                tokenizer = {k: v for k, v in create_move_to_idx().items() if v < vocab_size}
+            print(f"Loading ChessModel (4-token mode, vocab={vocab_size}, value_head={has_value_head}, packed={packed_positions})...")
+            model = ChessModel(vocab_size, n_embd, n_head, n_kv_heads, block_size, n_layer, dropout,
+                               use_chess=True, token_mode='4token',
+                               use_value_head=has_value_head, packed_positions=packed_positions)
+
+        elif has_factorized_heads:
+            print("ERROR: Old factorized-head checkpoint not compatible. Re-train with the current training script.")
+            return NONE8
+
+        elif has_mobile_llm_features:
+            # Legacy: MobileLLMModel checkpoint
+            print("Loading MobileLLMModel (legacy)...")
+            token_mode = 'classic'
+            if tokenizer is not None:
                 global move_to_idx
-                move_to_idx = tokenizer
+                move_to_idx = tokenizer   # MobileLLMModel.__init__ reads the module global
+            model = MobileLLMModel(vocab_size=vocab_size, n_embd=n_embd, n_head=n_head, n_kv_heads=n_kv_heads,
+                                   block_size=block_size, n_layer=n_layer, dropout=dropout, use_chess=True)
 
-            elif has_role_heads or fmt_version >= 2:
-                # New 4-token-per-ply format with role-specific heads
-                token_mode = '4token'
-                print("Loading ChessModel (role-specific heads, format v2)...")
-                n_kv_heads = hyperparameters.get('n_kv_heads', n_head // 4)
+        else:
+            # Legacy: basic TransformerModel checkpoint
+            print("Loading TransformerModel (legacy)...")
+            token_mode = 'classic'
+            model = TransformerModel(vocab_size=vocab_size, n_embd=n_embd, n_head=n_head,
+                                     block_size=block_size, n_layer=n_layer, dropout=dropout)
 
-                model = ChessModel(
-                    vocab_size=vocab_size,
-                    n_embd=n_embd,
-                    n_head=n_head,
-                    n_kv_heads=n_kv_heads,
-                    block_size=block_size,
-                    n_layer=n_layer,
-                    dropout=dropout,
-                    use_chess=True,
-                    token_mode='4token'
-                )
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing or unexpected:
+            print(f"State dict: missing={missing} unexpected={unexpected}")
+        else:
+            print("Model loaded successfully!")
 
-                # Use the 140-token tokenizer
-                tokenizer = create_move_to_idx()
+        # Attach per-model info for the GUI / generation helpers
+        model._token_mode = token_mode
+        model._tokenizer = tokenizer
+        model._tokenizer_reverse = {v: k for k, v in tokenizer.items()} if tokenizer else None
+        model._block_size = block_size
+        model._has_value_head = bool(has_value_head and isinstance(model, ChessModel))
+        model._special_ids = getattr(model, 'special_ids', None) or (
+            {n: tokenizer[n] for n in CLASSIC_SPECIAL_TOKENS if tokenizer and n in tokenizer})
+        model.eval()
+        model.to(device)
+        print(f"Model token mode: {token_mode}, block_size: {block_size}, device: {device}")
 
-            elif has_factorized_heads:
-                # Old factorized heads (v1) - not compatible
-                print("ERROR: Old factorized-head checkpoint not compatible. Re-train with Chess_Brain_WB_2_12_26.")
-                return None, None, None, None, None, None, None, None
-
-            elif has_mobile_llm_features:
-                # Medium-old checkpoint with MobileLLM features - use MobileLLMModel
-                print("Loading MobileLLMModel (chess-optimized)...")
-                n_kv_heads = hyperparameters.get('n_kv_heads', n_head // 4)
-                model = MobileLLMModel(
-                    vocab_size=vocab_size,
-                    n_embd=n_embd,
-                    n_head=n_head,
-                    n_kv_heads=n_kv_heads,
-                    block_size=block_size,
-                    n_layer=n_layer,
-                    dropout=dropout,
-                    use_chess=True
-                )
-                tokenizer = checkpoint.get('tokenizer')
-
-            else:
-                # Very old checkpoint - use basic TransformerModel
-                print("Loading TransformerModel (basic)...")
-                model = TransformerModel(
-                    vocab_size=vocab_size,
-                    n_embd=n_embd,
-                    n_head=n_head,
-                    block_size=block_size,
-                    n_layer=n_layer,
-                    dropout=dropout
-                )
-                tokenizer = checkpoint.get('tokenizer')
-
-            # Clean state dict keys if needed
-            # Handle common wrapper prefixes (DataParallel, torch.compile, etc.)
-            cleaned_sd = {}
-            for k, v in state_dict.items():
-                nk = k
-                # DataParallel prefix
-                if nk.startswith('module.'):
-                    nk = nk[len('module.'):]
-                # torch.compile (with or without DataParallel)
-                if nk.startswith('_orig_mod.module.'):
-                    nk = nk[len('_orig_mod.module.'):]
-                elif nk.startswith('_orig_mod.'):
-                    nk = nk[len('_orig_mod.'):]
-                cleaned_sd[nk] = v
-
-            state_dict = cleaned_sd
-            
-            # Try to load state dict, with error handling
-            try:
-                model.load_state_dict(state_dict)
-                print("Model loaded successfully!")
-            except RuntimeError as e:
-                print(f"Error loading state dict: {e}")
-                print("Attempting to load with strict=False...")
-                model.load_state_dict(state_dict, strict=False)
-
-            # Store token mode for generation routing
-            model._token_mode = token_mode
-            # Fix start_game_token for classic mode (ChessModel.__init__ uses Brain's global)
-            if token_mode == 'classic' and hasattr(model, 'start_game_token') and isinstance(tokenizer, dict):
-                model.start_game_token = tokenizer.get('<STARTGAME>', model.start_game_token)
-            print(f"Model token mode: {token_mode}")
-
-            return model, vocab_size, n_embd, n_head, block_size, n_layer, dropout, tokenizer
-
-        print("No model file selected.")
-        return None, None, None, None, None, None, None, None
+        return model, vocab_size, n_embd, n_head, block_size, n_layer, dropout, tokenizer
 
     except Exception as e:
-        print(f"An error occurred: {e}")
-        return None, None, None, None, None, None, None, None
+        print(f"An error occurred loading the checkpoint: {e}")
+        return NONE8
 
 
-def _generate_classic(model, tokenizer, tokenizer_reverse, input_text, top_k=10):
+# =============================================================================================
+# Prompt building and tokenisation (shared by classic and 4-token generation)
+# =============================================================================================
+def _model_info(model, tokenizer=None):
+    """(token_mode, tokenizer, block_size) for a loaded model, falling back to legacy globals."""
+    raw = model._orig_mod if hasattr(model, '_orig_mod') else model
+    token_mode = getattr(model, '_token_mode', None) or getattr(raw, 'token_mode', '4token')
+    tok = getattr(model, '_tokenizer', None) or tokenizer or global_tokenizer
+    if tok is None:
+        tok = create_classic_move_to_idx() if token_mode == 'classic' else create_move_to_idx()
+    block_size = getattr(model, '_block_size', None) or getattr(raw, 'block_size', 512)
+    return token_mode, tok, block_size
+
+
+def result_token_for_side(model, side):
+    """'<W>' for White / '<B>' for Black if this model's vocab has it (old models: <B> missing -> None)."""
+    _, tok, _ = _model_info(model)
+    name = RESULT_TOKEN_FOR_SIDE.get(side)
+    return name if name and name in tok else None
+
+
+def build_history_prompt(model, moves, side, result_token=None, reserve_tokens=None):
     """
-    Generate top-k candidate NEXT moves using classic 1-token-per-move model.
+    Build the text prompt the model sees: '<STARTGAME> <W|B> e2e4 e7e5 ...'.
 
-    Tokenizes the game history into single tokens, runs one forward pass,
-    and returns the top-k move tokens (excluding special tokens).
+    The header (<STARTGAME> + result token) is always kept; only the OLDEST moves are dropped
+    when the game is too long for block_size. `reserve_tokens` leaves room for the move being
+    generated (defaults to one move: 1 classic token / 4 role tokens).
 
-    Returns:
-        List of top-k UCI move strings (e.g. ['E2E4', 'G1F3', ...])
+    Args:
+        model:        loaded model (attributes from load_model_file)
+        moves:        list of UCI strings played so far (any case, no special tokens)
+        side:         'W' or 'B' — the side about to move (the neural player)
+        result_token: override the header token, e.g. '<U>' for value probing
     """
+    token_mode, tok, block_size = _model_info(model)
+    per_move = 1 if token_mode == 'classic' else 4
+    if reserve_tokens is None:
+        reserve_tokens = per_move
+    header = ['<STARTGAME>']
+    rt = result_token if result_token is not None else result_token_for_side(model, side)
+    if rt and rt in tok:
+        header.append(rt)
+    max_moves = max(0, (block_size - len(header) - reserve_tokens) // per_move)
+    kept = [m for m in moves if m and not m.startswith('<')]
+    if len(kept) > max_moves:
+        kept = kept[-max_moves:]
+    return ' '.join(header + kept)
+
+
+def _tokenize_history(input_text, tokenizer, token_mode):
+    """
+    Tokenise a game history string for either mode.
+
+    Returns (tokens, ply). Special tokens <STARTGAME> <EOFG> <PAD> <W> <D> <B> <U> are looked up in
+    the tokenizer (classic) or the role constants (4-token); ones the model does not know are skipped.
+    """
+    tokens = []
+    ply = 0
+    if token_mode == 'classic':
+        specials = tokenizer
+    else:
+        # Only special tokens this model's vocab knows (an old 140-token model has no <B>/<U>)
+        specials = {n: i for n, i in role_special_ids().items() if not tokenizer or n in tokenizer}
+    i, n = 0, len(input_text)
+    while i < n:
+        ch = input_text[i]
+        if ch == '<':
+            close = input_text.find('>', i)
+            if close == -1:
+                break
+            name = input_text[i:close + 1]
+            if name == '<STARTGAME>':
+                ply = 0
+            if name in specials:
+                tokens.append(specials[name])
+            i = close + 1
+            continue
+        if ch.isspace():
+            i += 1
+            continue
+        # UCI move: 4 chars, optional promotion letter
+        move_str = None
+        if i + 5 <= n and input_text[i + 4].lower() in 'qrbn' and input_text[i + 4].isalpha():
+            c = input_text[i:i + 5]
+            if c[0].isalpha() and c[1].isdigit() and c[2].isalpha() and c[3].isdigit():
+                move_str = c
+        if move_str is None and i + 4 <= n:
+            c = input_text[i:i + 4]
+            if c[0].isalpha() and c[1].isdigit() and c[2].isalpha() and c[3].isdigit():
+                move_str = c
+        if move_str is None:
+            i += 1
+            continue
+        i += len(move_str)
+        if token_mode == 'classic':
+            tid = tokenizer.get(move_str.upper())
+            if tid is not None:
+                tokens.append(tid)
+        else:
+            tokens.extend(parse_uci_move(move_str, ply % 2 == 0))
+        ply += 1
+    return tokens, ply
+
+
+# =============================================================================================
+# Move generation
+# =============================================================================================
+@torch.no_grad()
+def generate_candidates(model, input_text, top_k=10):
+    """
+    Top-k candidate NEXT moves with their model probability.
+
+    Returns a list of (uci_lowercase, prob) sorted best first. Legality is NOT checked here;
+    the GUI filters against its own legal-move list.
+    """
+    token_mode, tok, block_size = _model_info(model)
     model.eval()
     model.to(device)
-
-    if tokenizer is None:
-        print("Error: Tokenizer not available")
+    tokens, ply = _tokenize_history(input_text, tok, token_mode)
+    if not tokens:
         return []
+    raw = model._orig_mod if hasattr(model, '_orig_mod') else model
 
-    # Build reverse map for special token IDs
-    special_names = {'<STARTGAME>', '<EOFG>', '<PAD>', '<W>', '<D>'}
-    special_ids = {tokenizer[n] for n in special_names if n in tokenizer}
-
-    # Tokenize game history
-    tokens = []
-    i = 0
-    while i < len(input_text):
-        if input_text[i:i+11] == '<STARTGAME>':
-            tokens.append(tokenizer['<STARTGAME>']); i += 11
-        elif input_text[i:i+6] == '<EOFG>':
-            tokens.append(tokenizer['<EOFG>']); i += 6
-        elif input_text[i:i+3] == '<W>':
-            tokens.append(tokenizer['<W>']); i += 3
-        elif input_text[i:i+3] == '<D>':
-            tokens.append(tokenizer['<D>']); i += 3
-        elif input_text[i].isspace():
-            i += 1
-        elif i + 4 <= len(input_text):
-            move_str = None
-            if i + 5 <= len(input_text) and input_text[i+4].isalpha() and input_text[i+4].lower() in 'qrbn':
-                c = input_text[i:i+5].upper()
-                if c[0].isalpha() and c[1].isdigit() and c[2].isalpha() and c[3].isdigit():
-                    if c in tokenizer:
-                        move_str = c; i += 5
-            if move_str is None:
-                c = input_text[i:i+4].upper()
-                if c[0].isalpha() and c[1].isdigit() and c[2].isalpha() and c[3].isdigit():
-                    if c in tokenizer:
-                        move_str = c; i += 4
-                    else:
-                        i += 1; continue
-                else:
-                    i += 1; continue
-            tokens.append(tokenizer[move_str])
-        else:
-            i += 1
-
-    # Truncate to block_size
-    block_size = model.block_size if hasattr(model, 'block_size') else 512
-    if len(tokens) > block_size:
+    if token_mode == 'classic':
         tokens = tokens[-block_size:]
-
-    input_seq = torch.tensor([tokens], dtype=torch.long).to(device)
-
-    with torch.no_grad():
-        logits, _ = model(input_seq)
-        next_logits = logits[0, -1]  # [vocab_size]
-
-        # Mask out special tokens
+        logits, _ = model(torch.tensor([tokens], dtype=torch.long, device=device))
+        next_logits = logits[0, -1].float()
+        special_ids = {tok[n] for n in CLASSIC_SPECIAL_TOKENS if n in tok}
         for sid in special_ids:
-            next_logits[sid] = float('-inf')
-
-        # Get top-k
+            if sid < next_logits.shape[0]:
+                next_logits[sid] = float('-inf')
         probs = F.softmax(next_logits, dim=-1)
-        top_probs, top_ids = torch.topk(probs, k=min(top_k, len(probs)))
+        top_probs, top_ids = torch.topk(probs, k=min(top_k, probs.shape[0]))
+        rev = getattr(model, '_tokenizer_reverse', None) or {v: k for k, v in tok.items()}
+        out = []
+        for p, tid in zip(top_probs.tolist(), top_ids.tolist()):
+            name = rev.get(tid, '')
+            if name and not name.startswith('<'):
+                out.append((name.lower(), p))
+        return out
 
-        result_moves = []
-        for tid in top_ids:
-            move_name = tokenizer_reverse.get(tid.item(), '')
-            if move_name and move_name not in special_names:
-                # Classic tokens are like "E2E4" or "E7E8Q" — lowercase for UCI
-                result_moves.append(move_name.lower())
+    # ---- 4-token mode: COLOR -> FROM -> (per FROM) TO -> PROMO ----
+    is_white = (ply % 2 == 0)
+    seq = tokens + [COLOR_OFFSET + (0 if is_white else 1)]
+    seq = seq[-block_size:]
+    input_seq = torch.tensor([seq], dtype=torch.long, device=device)
 
-    print(f"Classic top {len(result_moves)} candidate moves: {result_moves}")
-    return result_moves
+    output, _ = model(input_seq)
+    from_probs = F.softmax(output['from'][0, -1].float(), dim=-1)
+    num_from = min(top_k, 64)
+    top_from_probs, top_from_sqs = torch.topk(from_probs, k=num_from)
+
+    # One batched forward for all FROM candidates (same length)
+    from_sqs = top_from_sqs.tolist()
+    batch = torch.cat([input_seq.expand(num_from, -1),
+                       (FROM_OFFSET + top_from_sqs).unsqueeze(1)], dim=1)
+    if batch.shape[1] > block_size:
+        batch = batch[:, -block_size:]
+    output2, _ = model(batch)
+    h_last = output2['hidden'][:, -1]                                   # [K, n_embd]
+    from_emb = raw.emb_from(torch.tensor(from_sqs, device=device))      # [K, n_embd]
+    to_logits = raw.head_to(h_last + from_emb).float()                  # [K, 64]
+    to_logits[torch.arange(num_from), torch.tensor(from_sqs, device=device)] = float('-inf')  # TO != FROM
+    to_probs = F.softmax(to_logits, dim=-1)
+
+    candidates = []   # (score, from_sq, to_sq, promo_idx)
+    promo_needed = []  # (index into candidates, seq)
+    for fi in range(num_from):
+        from_sq = from_sqs[fi]
+        from_prob = top_from_probs[fi].item()
+        top_to_probs, top_to_sqs = torch.topk(to_probs[fi], k=3)
+        for to_prob, to_sq in zip(top_to_probs.tolist(), top_to_sqs.tolist()):
+            from_rank = 8 - (from_sq // 8)
+            to_rank = 8 - (to_sq // 8)
+            is_promo = (is_white and from_rank == 7 and to_rank == 8) or (not is_white and from_rank == 2 and to_rank == 1)
+            candidates.append([from_prob * to_prob, from_sq, to_sq, 0])
+            if is_promo:
+                promo_needed.append((len(candidates) - 1, seq + [FROM_OFFSET + from_sq, TO_OFFSET + to_sq]))
+
+    if promo_needed:
+        pb = torch.tensor([s[-block_size:] for _, s in promo_needed], dtype=torch.long, device=device)
+        output3, _ = model(pb)
+        promo_idx = output3['promo'][:, -1].argmax(dim=-1).tolist()
+        for (ci, _), pidx in zip(promo_needed, promo_idx):
+            candidates[ci][3] = pidx if pidx > 0 else 1   # never "none" on a promotion square
+
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    promo_chars = ['', 'q', 'r', 'b', 'n']
+    out, seen = [], set()
+    for score, from_sq, to_sq, pidx in candidates:
+        uci = square_to_uci(from_sq) + square_to_uci(to_sq) + promo_chars[pidx]
+        if uci not in seen:
+            seen.add(uci)
+            out.append((uci, score))
+            if len(out) >= top_k:
+                break
+    return out
 
 
 def generate_response(model, tokenizer, tokenizer_reverse, input_text,
-                     tokens_to_generate=5, top_k=10, use_characters=False, use_chess_moves=True, use_dna=False):
+                      tokens_to_generate=5, top_k=10, use_characters=False, use_chess_moves=True, use_dna=False):
     """
-    Generate top-k candidate NEXT moves.
+    Top-k candidate NEXT moves as plain UCI strings (kept for API compatibility).
 
-    Routes to classic or 4-token generation based on model._token_mode.
-
-    Returns a list of up to top_k UCI move strings (e.g. ['e2e4', 'g1f3', ...])
-    ranked by model confidence. The chess game checks legality and picks the first legal one.
-
-    Args:
-        model: ChessModel with role-specific heads
-        tokenizer: 140-token vocab dict
-        tokenizer_reverse: Reverse mapping
-        input_text: Game history string (e.g. "<STARTGAME> e2e4 e7e5 ...")
-        tokens_to_generate: Unused (kept for API compatibility)
-        top_k: Number of candidate moves to return (default: 10)
-        use_characters/use_chess_moves/use_dna: Unused (API compatibility)
-
-    Returns:
-        List of top-k UCI move strings (e.g. ['e2e4', 'g1f3', 'd2d4', ...])
+    Routes to classic or 4-token generation from the model's attributes.
+    `tokenizer` / `tokenizer_reverse` are only used if the model has no attached tokenizer.
+    `tokens_to_generate`, `use_characters`, `use_chess_moves`, `use_dna` are unused.
     """
-    # Route to classic generation if model is in classic mode
-    token_mode = getattr(model, '_token_mode', None)
-    if token_mode is None:
-        # Check inside torch.compile wrapper
-        model_raw = model._orig_mod if hasattr(model, '_orig_mod') else model
-        token_mode = getattr(model_raw, 'token_mode', '4token')
-    if token_mode == 'classic':
-        return _generate_classic(model, tokenizer, tokenizer_reverse, input_text, top_k)
+    if getattr(model, '_tokenizer', None) is None and tokenizer is not None:
+        model._tokenizer = tokenizer
+        model._tokenizer_reverse = tokenizer_reverse or {v: k for k, v in tokenizer.items()}
+    cands = generate_candidates(model, input_text, top_k=top_k)
+    moves = [uci for uci, _ in cands]
+    print(f"Top {len(moves)} candidate moves: {moves}")
+    return moves
 
-    # === 4-TOKEN MODE: existing generation logic ===
-    model.eval()
-    model.to(device)
 
-    if tokenizer is None:
-        print("Error: Tokenizer not available")
+@torch.no_grad()
+def rerank_by_value(model, moves, side, candidate_ucis):
+    """
+    Score legal candidate moves with the value head.
+
+    For each candidate, the prompt is '<STARTGAME> <U> moves... candidate' (result hidden with
+    <U> so the head has to judge the position) and the score is P(side wins) - P(side loses).
+    Returns [(uci, value_score)] in the order given, or [] if the model has no value head.
+    """
+    if not getattr(model, '_has_value_head', False) or not candidate_ucis:
         return []
-
-    # Tokenize game history into 4-token-per-ply format
-    tokens = []
-    ply = 0
-    i = 0
-    while i < len(input_text):
-        if input_text[i:i+11] == '<STARTGAME>':
-            tokens.append(STARTGAME); ply = 0; i += 11
-        elif input_text[i:i+6] == '<EOFG>':
-            tokens.append(EOFG); i += 6
-        elif input_text[i:i+3] == '<W>':
-            tokens.append(W_RESULT); i += 3
-        elif input_text[i:i+3] == '<D>':
-            tokens.append(D_RESULT); i += 3
-        elif input_text[i].isspace():
-            i += 1
-        elif i + 4 <= len(input_text):
-            move_str = None
-            if i + 5 <= len(input_text) and input_text[i+4].isalpha() and input_text[i+4].lower() in 'qrbn':
-                c = input_text[i:i+5]
-                if c[0].isalpha() and c[1].isdigit() and c[2].isalpha() and c[3].isdigit():
-                    move_str = c; i += 5
-            if move_str is None:
-                c = input_text[i:i+4]
-                if c[0].isalpha() and c[1].isdigit() and c[2].isalpha() and c[3].isdigit():
-                    move_str = c; i += 4
-                else:
-                    i += 1; continue
-            is_white = (ply % 2 == 0)
-            ct, ft, tt, pt = parse_uci_move(move_str, is_white)
-            tokens.extend([ct, ft, tt, pt])
-            ply += 1
+    token_mode, tok, block_size = _model_info(model)
+    if '<U>' not in tok:
+        return []
+    raw = model._orig_mod if hasattr(model, '_orig_mod') else model
+    prompt = build_history_prompt(model, moves, side, result_token='<U>')
+    base, ply = _tokenize_history(prompt, tok, token_mode)
+    rows = []
+    for uci in candidate_ucis:
+        if token_mode == 'classic':
+            tid = tok.get(uci.upper())
+            if tid is None:
+                return []   # candidate outside the vocab (should not happen for legal UCI)
+            rows.append((base + [tid])[-block_size:])
         else:
-            i += 1
+            rows.append((base + list(parse_uci_move(uci, ply % 2 == 0)))[-block_size:])
+    probs = raw.predict_value(torch.tensor(rows, dtype=torch.long, device=device))   # [K, 3]
+    win_col, lose_col = (0, 2) if side == 'W' else (2, 0)
+    scores = (probs[:, win_col] - probs[:, lose_col]).tolist()
+    return list(zip(candidate_ucis, scores))
 
-    # Truncate to block_size
-    block_size = model.block_size if hasattr(model, 'block_size') else 512
-    if len(tokens) > block_size:
-        tokens = tokens[-block_size:]
-
-    input_seq = torch.tensor([tokens], dtype=torch.long).to(device)
-
-    # Handle torch.compile wrapper for direct attribute access
-    model_raw = model._orig_mod if hasattr(model, '_orig_mod') else model
-
-    with torch.no_grad():
-        # Step 1: Predict COLOR (we know what it should be, but let model confirm)
-        is_white = (ply % 2 == 0)
-        color_tok = COLOR_OFFSET + (0 if is_white else 1)
-        input_seq = torch.cat([input_seq, torch.tensor([[color_tok]], device=device)], dim=1)
-        if input_seq.shape[1] > block_size:
-            input_seq = input_seq[:, -block_size:]
-
-        # Step 2: Get FROM probabilities
-        output, _ = model(input_seq)
-        from_logits = output['from'][0, -1]  # [64]
-        from_probs = F.softmax(from_logits, dim=-1)
-
-        # Get top-k FROM squares
-        num_from = min(top_k, 64)
-        top_from_probs, top_from_sqs = torch.topk(from_probs, k=num_from)
-
-        # Step 3: For each candidate FROM, predict TO (conditioned on FROM)
-        candidates = []  # (score, from_sq, to_sq, promo_idx)
-
-        for fi in range(num_from):
-            from_sq = top_from_sqs[fi].item()
-            from_prob = top_from_probs[fi].item()
-            from_tok = FROM_OFFSET + from_sq
-
-            # Append FROM token and run forward
-            seq_with_from = torch.cat([input_seq, torch.tensor([[from_tok]], device=device)], dim=1)
-            if seq_with_from.shape[1] > block_size:
-                seq_with_from = seq_with_from[:, -block_size:]
-
-            output2, _ = model(seq_with_from)
-            h_last = output2['hidden'][0, -1]
-
-            # Condition on FROM for TO prediction
-            from_emb = model_raw.emb_from(torch.tensor(from_sq, device=device))
-            h_conditioned = h_last + from_emb
-            to_logits = model_raw.head_to(h_conditioned)
-            to_logits[from_sq] = float('-inf')  # TO != FROM
-            to_probs = F.softmax(to_logits, dim=-1)
-
-            # Top TO squares for this FROM
-            num_to = min(3, 64)
-            top_to_probs, top_to_sqs = torch.topk(to_probs, k=num_to)
-
-            for ti in range(num_to):
-                to_sq = top_to_sqs[ti].item()
-                to_prob = top_to_probs[ti].item()
-                score = from_prob * to_prob
-
-                # Check if promotion (pawn reaching back rank)
-                from_rank = 8 - (from_sq // 8)
-                to_rank = 8 - (to_sq // 8)
-                is_promo = (is_white and from_rank == 7 and to_rank == 8) or \
-                           (not is_white and from_rank == 2 and to_rank == 1)
-
-                if is_promo:
-                    # Get promo prediction
-                    to_tok = TO_OFFSET + to_sq
-                    seq_with_to = torch.cat([seq_with_from,
-                                             torch.tensor([[to_tok]], device=device)], dim=1)
-                    if seq_with_to.shape[1] > block_size:
-                        seq_with_to = seq_with_to[:, -block_size:]
-                    output3, _ = model(seq_with_to)
-                    promo_logits = output3['promo'][0, -1]
-                    promo_idx = promo_logits.argmax(dim=-1).item()
-                    if promo_idx == 0:
-                        promo_idx = 1  # Default to queen if model says none
-                else:
-                    promo_idx = 0
-
-                candidates.append((score, from_sq, to_sq, promo_idx))
-
-        # Sort by score (descending) and return top-k UCI strings
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        promo_chars = ['', 'q', 'r', 'b', 'n']
-
-        result_moves = []
-        seen = set()
-        for score, from_sq, to_sq, promo_idx in candidates:
-            uci = square_to_uci(from_sq) + square_to_uci(to_sq)
-            if promo_idx > 0 and promo_idx < len(promo_chars):
-                uci += promo_chars[promo_idx]
-            if uci not in seen:
-                seen.add(uci)
-                result_moves.append(uci)
-                if len(result_moves) >= top_k:
-                    break
-
-        print(f"Top {len(result_moves)} candidate moves: {result_moves}")
-        return result_moves
 
 # Chess Inference API:
-# generate_response():
-#   - Top-k sampling for diverse chess move generation
-#   - Chess coordinate notation tokenization
-#   - Returns list of possible move continuations
-#   - Used for: ChessBrain integration, move prediction API
+# generate_candidates(): top-k (uci, prob) for the next move
+# generate_response():   same, plain UCI list (legacy signature)
+# rerank_by_value():     value-head score per candidate (needs a checkpoint with has_value_head)
+# build_history_prompt(): '<STARTGAME> <W|B> moves...' with block-size-safe truncation
 
 
 def initialize_model(checkpoint_path=None):
@@ -1137,19 +1141,18 @@ def initialize_model(checkpoint_path=None):
     Provides programmatic access to chess move generation without reloading.
 
     Global State Set:
-    - global_model: Loaded MobileLLM chess model
+    - global_model: Loaded chess model
     - global_tokenizer: Chess move tokenizer (dict)
     - global_tokenizer_reverse: Reverse mapping for move decoding
+
+    Note: the GUI should prefer the per-model attributes (model._tokenizer, model._block_size,
+    model._token_mode) because the globals are overwritten each time a model is loaded.
 
     Args:
         checkpoint_path: Path to a .pth file. If None, returns None (caller must supply a path).
 
     Returns:
         Loaded model instance, or None if loading failed
-
-    Usage:
-        initialize_model(checkpoint_path="/path/to/model.pth")
-        # Then use global_model for multiple chess inferences
     """
     global global_model, global_tokenizer, global_tokenizer_reverse
 
@@ -1157,7 +1160,6 @@ def initialize_model(checkpoint_path=None):
         print("initialize_model: checkpoint_path is required.")
         return None
 
-    # Load chess model
     model, vocab_size, n_embd, n_head, block_size, n_layer, dropout, tokenizer = load_model_file(
         checkpoint_path=checkpoint_path
     )
@@ -1165,7 +1167,6 @@ def initialize_model(checkpoint_path=None):
         print("Failed to load chess model.")
         return None
 
-    # Set global state for chess API usage
     global_model = model
     global_tokenizer = tokenizer
     if tokenizer is not None:
@@ -1175,4 +1176,3 @@ def initialize_model(checkpoint_path=None):
         global_tokenizer_reverse = None
 
     return model
-

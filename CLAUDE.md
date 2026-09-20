@@ -16,10 +16,10 @@ git pull origin main
 pip install -r chess_requirement.txt
 
 # Train a model (interactive prompts for mode, data, GPUs)
-python Chess_Brain_3_21_26.py
+python Chess_Brain_mp_spawn_9_20_26.py
 
 # Play chess via Pygame GUI (human / CPU Search / Neural per side)
-python Chess_4_8_26.py
+python Chess_9_20_26.py
 
 # Plot training loss from checkpoint filenames
 python plot_loss_March_20_26.py [checkpoint_folder]
@@ -34,11 +34,11 @@ There is no test suite. Validation is done through GUI play, move legality track
 
 ### Three Main Files
 
-- **`Chess_Brain_3_21_26.py`** — Training script. Model definition, both dataset classes, data loading, full training loop with multi-GPU support.
+- **`Chess_Brain_mp_spawn_9_20_26.py`** — Preferred training (result-aware, packing, value head, DDP multi-GPU / single-GPU). Sept 20, 2026. Platforms: DGX Spark / multi-GPU NVIDIA Ubuntu for train; Mac for play/inference only (see README).
 - **`Chess_Inference.py`** — Inference engine. Auto-detects checkpoint mode (classic vs 4-token) and provides `generate_response()` for move generation.
-- **`Chess_4_8_26.py`** — Pygame GUI. Imports `Chess_Inference` as `brain_inference`. Human play, classical CPU **Search** (alpha-beta; optional Stockfish), and **Neural** (LLM) per side.
+- **`Chess_9_20_26.py`** — Pygame GUI. Imports `Chess_Inference` as `brain_inference`. Human play, classical CPU **Search** (alpha-beta; optional Stockfish), and **Neural** (LLM) per side.
 
-Older dated copies of training/data utilities live under **`OLD chess brains/`** for reference only.
+Older dated copies (`Chess_Brain_mp_spawn_4_12_26.py`, `Chess_4_8_26.py`, `Chess_Brain_3_21_26.py`, utilities under **`OLD chess brains/`**) are for reference or in-progress runs only.
 
 ### Two Tokenization Modes (selected at training startup)
 

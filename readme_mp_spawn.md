@@ -1,14 +1,27 @@
-# Chess_Brain_mp_spawn_4_12_26.py
+# Chess_Brain_mp_spawn_9_20_26.py
 
-DDP (DistributedDataParallel) version of the chess training script. All GPUs train simultaneously via NCCL instead of sequentially.
+DDP (DistributedDataParallel) chess trainer — **Sept 20, 2026** dated name.
+(Older copy `Chess_Brain_mp_spawn_4_12_26.py` kept for in-progress runs; use **9_20_26** for new work.)
+
+All selected NVIDIA GPUs train simultaneously via NCCL instead of sequentially.
 
 ## Usage
 
 ```bash
-python Chess_Brain_mp_spawn_4_12_26.py
+python Chess_Brain_mp_spawn_9_20_26.py
 ```
 
 Same interactive prompts as before: load/create model, select GPUs, pick data file, set hyperparameters. No torchrun or special launcher needed.
+
+## Platform support (Sept 20, 2026)
+
+| Machine | Train? | Notes |
+|---------|--------|--------|
+| **DGX Spark / GB10** | Yes (primary) | Single-GPU recommended; set `PYTORCH_ALLOC_CONF` (not the old `PYTORCH_CUDA_ALLOC_CONF`). See header in `Chess_Brain_mp_spawn_9_20_26.py`. |
+| **Multi-GPU Ubuntu (NVIDIA)** | Yes | Pick 2+ CUDA GPUs; `mp.spawn` + NCCL. Batch size = total across GPUs. |
+| **Apple Mac** | Not for serious training | MPS single-device path exists but is not a supported train target. **Play** with `Chess_9_20_26.py` + a `.pth` from Spark/Ubuntu (`CHESS_DEVICE=mps` optional). Multi-GPU DDP will not run (NCCL is CUDA-only). |
+
+No extensive Mac/AMD port in this tree — train on NVIDIA Linux, copy checkpoints to the Mac for the GUI.
 
 ## What changed from Chess_Brain_3_21_26.py
 
@@ -25,7 +38,7 @@ The old multi-GPU code ran one GPU at a time in a loop — forward on GPU 0, wai
 ## Checkpoint compatibility
 
 - **Old checkpoints load into this script.** Optimizer state lists (from the old multi-GPU format) are handled automatically.
-- **New checkpoints work with Chess_Inference.py and Chess_4_8_26.py.** Same `model_state_dict`, same `hyperparameters` dict, same `tokenizer` field.
+- **New checkpoints work with Chess_Inference.py and Chess_9_20_26.py.** Same `model_state_dict`, same `hyperparameters` dict, same `tokenizer` field.
 - **No GPU count restriction.** Train on 4 GPUs, resume on 1 (or vice versa). The old script required matching GPU counts because it saved per-GPU optimizer states. This version saves a single optimizer state.
 
 ## How DDP works here
@@ -44,7 +57,7 @@ For single GPU, DDP is skipped entirely — no spawn, no overhead.
 Both tokenization modes are fully supported:
 
 - **Classic mode** (1 token per move, ~20K vocab, 64x63x5 move tokens) — single `lm_head` output, weight-tied to embeddings.
-- **4-token mode** (4 tokens per ply, 140 vocab: COLOR/FROM/TO/PROMO) — four role-specific output heads with FROM-conditioned TO prediction.
+- **4-token mode** (4 tokens per ply, 140–142 vocab: COLOR/FROM/TO/PROMO + result tokens) — four role-specific output heads with FROM-conditioned TO prediction.
 
 Mode is selected at training startup (new model) or auto-detected from checkpoint. DDP is transparent to both — it synchronizes gradients after `backward()` regardless of how the loss was computed internally.
 
@@ -52,17 +65,18 @@ Mode is selected at training startup (new model) or auto-detected from checkpoin
 
 - **Batch size** is the total across all GPUs. With batch_size=512 on 4 GPUs, each GPU processes 128 samples per step.
 - **Loss values** reported are from rank 0's shard only (representative, not averaged across ranks).
-- **Ctrl+C** in multi-GPU mode: pause, change LR, or quit. Loading new data requires quit and restart (can't synchronize new data across DDP workers mid-training). Single-GPU mode supports all options including mid-training data change.
+- **Ctrl+C**: pause, change LR, load new data (`d`), or quit (`q`, saves checkpoint). Multi-GPU and single-GPU both support mid-run data change (rank 0 tokenizes; workers pick up shared tensors).
 - **torch.compile** is applied in single-GPU mode only (DDP handles optimization differently).
 
 ## Files
 
 | File | Role |
 |---|---|
-| `Chess_Brain_mp_spawn_4_12_26.py` | Training (this version, DDP multi-GPU) |
+| `Chess_Brain_mp_spawn_9_20_26.py` | Training (preferred, DDP multi-GPU) — Sept 20, 2026 |
+| `Chess_Brain_mp_spawn_4_12_26.py` | Same trainer, older filename (keep for active runs) |
 | `Chess_Brain_3_21_26.py` | Training (original, sequential multi-GPU) |
 | `Chess_Inference.py` | Inference engine (works with checkpoints from either) |
-| `Chess_4_8_26.py` | Pygame GUI (works with checkpoints from either) |
+| `Chess_9_20_26.py` | Pygame GUI (works with checkpoints from either) |
 
 ---
 
@@ -99,7 +113,7 @@ Apply to model state dict and optimizer state dict before putting them in `train
 if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)  # DELETE THIS
 
-# GOOD — mp.spawn already defaults to spawn start_method internally
+# GOOD — mp.set_start_method already defaults to spawn start_method internally
 ```
 
 ### 3. Guard module-level CUDA init from running in DDP workers
