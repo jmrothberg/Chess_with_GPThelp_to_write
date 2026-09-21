@@ -915,9 +915,9 @@ def _select_best_ai_move_inner(
     if rep_path is None:
         rep_path = []
 
-    # Threefold (game history + this search line) is a draw — stronger Search will not
-    # shuffle to repeat when ahead, and will take the draw when behind.
-    if _position_rep_count(board, color, rep_path) >= 3:
+    # Threefold (game history + this search line) is a draw.
+    rep_n = _position_rep_count(board, color, rep_path)
+    if rep_n >= 3:
         return 0.0, []
     node_key = board_to_hashable(board, color)
     child_path = rep_path + [node_key]
@@ -931,7 +931,10 @@ def _select_best_ai_move_inner(
     # Minimax value is side-independent; key is position + side to move (not AI_color).
     board_key = (zobrist_hash_board(board, color, last_move, castle_rights), color)
     tt_move = None
-    if use_transposition and board_key in transposition_table:
+    # TT must NOT be used when this position was already seen: a prior +12 score can
+    # hide a later shuffle that is actually a threefold draw (classic engine bug).
+    use_tt_here = use_transposition and rep_n == 0
+    if use_tt_here and board_key in transposition_table:
         stored = transposition_table[board_key]
         eval_board, eval_depth, best_move_new = stored[0], stored[1], stored[2]
         flag = stored[3] if len(stored) > 3 else TT_EXACT
@@ -1041,35 +1044,45 @@ def _select_best_ai_move_inner(
         if check:
             next_d = min(depth, initial_depth + 2)
 
-        if depth >= 3 and move_index > 3 and not check and not tgt_before:
-            eval_board, opponent_best_move = _select_best_ai_move_inner(
-                board, max(0, next_d - 1), opp, AI_color, alpha, beta, display_simulation, move, initial_depth, child_pst, None, castle_rights, child_path,
-            )
-            if (color == "W" and eval_board < alpha) or (color == "B" and eval_board > beta):
-                search_undo_move(board, undo)
-                continue
-
-        # PVS: first move full window; later moves zero-window then re-search if they beat alpha/beta.
-        if move_index == 0:
-            eval_board, opponent_best_move = _select_best_ai_move_inner(
-                board, next_d, opp, AI_color, alpha, beta, display_simulation, move, initial_depth, child_pst, None, castle_rights, child_path,
-            )
-        elif color == "W":
-            eval_board, opponent_best_move = _select_best_ai_move_inner(
-                board, next_d, opp, AI_color, alpha, alpha + PVS_WINDOW, display_simulation, move, initial_depth, child_pst, None, castle_rights, child_path,
-            )
-            if eval_board > alpha:
-                eval_board, opponent_best_move = _select_best_ai_move_inner(
-                    board, next_d, opp, AI_color, alpha, beta, display_simulation, move, initial_depth, child_pst, None, castle_rights, child_path,
-                )
+        # How many times this (board, opp-to-move) already appears (before this visit)
+        prev_rep = _position_rep_count(board, opp, child_path)
+        clearly_winning = (color == "W" and pst_acc > 2.0) or (color == "B" and pst_acc < -2.0)
+        if prev_rep >= 2:
+            # This move completes a threefold → draw
+            eval_board, opponent_best_move = 0.0, []
+        elif prev_rep >= 1 and clearly_winning:
+            # Clearly ahead: refuse to step back into a known position (stops shuffle-draws)
+            eval_board, opponent_best_move = 0.0, []
         else:
-            eval_board, opponent_best_move = _select_best_ai_move_inner(
-                board, next_d, opp, AI_color, beta - PVS_WINDOW, beta, display_simulation, move, initial_depth, child_pst, None, castle_rights, child_path,
-            )
-            if eval_board < beta:
+            if depth >= 3 and move_index > 3 and not check and not tgt_before:
+                eval_board, opponent_best_move = _select_best_ai_move_inner(
+                    board, max(0, next_d - 1), opp, AI_color, alpha, beta, display_simulation, move, initial_depth, child_pst, None, castle_rights, child_path,
+                )
+                if (color == "W" and eval_board < alpha) or (color == "B" and eval_board > beta):
+                    search_undo_move(board, undo)
+                    continue
+
+            # PVS: first move full window; later moves zero-window then re-search if they beat alpha/beta.
+            if move_index == 0:
                 eval_board, opponent_best_move = _select_best_ai_move_inner(
                     board, next_d, opp, AI_color, alpha, beta, display_simulation, move, initial_depth, child_pst, None, castle_rights, child_path,
                 )
+            elif color == "W":
+                eval_board, opponent_best_move = _select_best_ai_move_inner(
+                    board, next_d, opp, AI_color, alpha, alpha + PVS_WINDOW, display_simulation, move, initial_depth, child_pst, None, castle_rights, child_path,
+                )
+                if eval_board > alpha:
+                    eval_board, opponent_best_move = _select_best_ai_move_inner(
+                        board, next_d, opp, AI_color, alpha, beta, display_simulation, move, initial_depth, child_pst, None, castle_rights, child_path,
+                    )
+            else:
+                eval_board, opponent_best_move = _select_best_ai_move_inner(
+                    board, next_d, opp, AI_color, beta - PVS_WINDOW, beta, display_simulation, move, initial_depth, child_pst, None, castle_rights, child_path,
+                )
+                if eval_board < beta:
+                    eval_board, opponent_best_move = _select_best_ai_move_inner(
+                        board, next_d, opp, AI_color, alpha, beta, display_simulation, move, initial_depth, child_pst, None, castle_rights, child_path,
+                    )
         search_undo_move(board, undo)
 
         if color == "W":
@@ -1090,7 +1103,7 @@ def _select_best_ai_move_inner(
                 history_heuristic[hs][he] += depth * depth
             break
 
-    if use_transposition:
+    if use_tt_here:
         if best_eval <= orig_alpha:
             flag = TT_UPPER
         elif best_eval >= orig_beta:
@@ -1128,12 +1141,20 @@ def _root_search_worker(payload):
     best_eval = float("-inf") if color == "W" else float("inf")
     best_line = []
     opp = "B" if color == "W" else "W"
+    root_key = board_to_hashable(board, color)
+    root_pst = _evaluate_pst_material(board)
+    clearly_winning = (color == "W" and root_pst > 2.0) or (color == "B" and root_pst < -2.0)
     for move in moves:
         undo, _d = search_apply_move(board, move, last_move, castle_rights=castle_rights)
-        pst = _evaluate_pst_material(board)
-        ev, pv = _select_best_ai_move_inner(
-            board, depth - 1, opp, AI_color, float("-inf"), float("inf"), False, move, initial_depth, pst, None, castle_rights,
-        )
+        # Same anti-shuffle rule as main search when clearly ahead
+        prev_rep = _position_rep_count(board, opp, [root_key])
+        if prev_rep >= 2 or (prev_rep >= 1 and clearly_winning):
+            ev, pv = 0.0, []
+        else:
+            pst = _evaluate_pst_material(board)
+            ev, pv = _select_best_ai_move_inner(
+                board, depth - 1, opp, AI_color, float("-inf"), float("inf"), False, move, initial_depth, pst, None, castle_rights, [root_key],
+            )
         search_undo_move(board, undo)
         if (color == "W" and ev > best_eval) or (color == "B" and ev < best_eval):
             best_eval = ev
