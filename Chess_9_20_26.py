@@ -37,11 +37,19 @@ pygame.init()
 
 # Constants for the game
 SCREEN_WIDTH = 1200
-# Board is 8*150=1200 tall; extra strip below so help/status never cover pieces
+# Board is 8*150=1200 tall; extra strip below so help never covers pieces
 SCREEN_HEIGHT = 1540
 BOARD_SIZE = 8
 SQUARE_SIZE = SCREEN_WIDTH // BOARD_SIZE
-BOARD_PIXEL_H = BOARD_SIZE * SQUARE_SIZE  # top of the status/help strip
+BOARD_PIXEL_H = BOARD_SIZE * SQUARE_SIZE  # top of the status strip (flush under board)
+# Status band height matches the old SCREEN_HEIGHT=1400 layout (1400-1200).
+# Extra window pixels below this band are for the help overlay only.
+STATUS_BAND_H = 200
+
+def status_y(from_bottom):
+    """Y for status text: flush under board (not SCREEN_HEIGHT — that left a white gap)."""
+    return BOARD_PIXEL_H + STATUS_BAND_H - from_bottom
+
 GRAY = (128, 128, 128)
 BLACK = (0, 0, 0)
 WHITE = (255, 255, 255)
@@ -83,7 +91,9 @@ llm_stats = {
     'first_legal': 0,
     'second_legal': 0,
     'third_plus_legal': 0,
-    'no_legal': 0
+    'no_legal': 0,
+    # Times value-head re-rank skipped the move-picker's #1 for a better win guess
+    'value_overrides': 0,
 }
 
 # Initialize the screen with given dimensions
@@ -697,8 +707,8 @@ def simulate_move(board, move, real_board=False):
         notation = convert_to_chess_notation(new_board, move)
 
     if real_board:
-        pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 200, SCREEN_WIDTH - 50,50))
-        pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 50, SCREEN_WIDTH - 50,50))
+        pygame.draw.rect(screen, WHITE, (25, status_y(200), SCREEN_WIDTH - 50,50))
+        pygame.draw.rect(screen, WHITE, (25, status_y(50), SCREEN_WIDTH - 50,50))
     
     # ======================================================================================
     # PAWN PROMOTION RULE
@@ -742,8 +752,8 @@ def simulate_move(board, move, real_board=False):
                 else:
                     print("Promoted to queen as default (knight promotion doesn't lead to immediate checkmate)")
             if real_board:
-                pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 195, SCREEN_WIDTH - 50,50))
-                screen.blit(font.render(f"{original_piece} promoted to {piece_dict[piece]}", True, BLACK), (27, SCREEN_HEIGHT - 195))
+                pygame.draw.rect(screen, WHITE, (25, status_y(195), SCREEN_WIDTH - 50,50))
+                screen.blit(font.render(f"{original_piece} promoted to {piece_dict[piece]}", True, BLACK), (27, status_y(195)))
                 read_aloud(f"{original_piece} promoted to {piece_dict[piece]}")
             
     # Handle en passant
@@ -753,16 +763,16 @@ def simulate_move(board, move, real_board=False):
             if show_simulation and real_board:
                 print(f"Simulated en passant capture. {notation}.")
             if real_board:
-                pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 150, SCREEN_WIDTH - 50,50))
-                screen.blit(font.render(f"en passant capture. {notation}", True, BLACK), (27 ,SCREEN_HEIGHT - 150))
+                pygame.draw.rect(screen, WHITE, (25, status_y(150), SCREEN_WIDTH - 50,50))
+                screen.blit(font.render(f"en passant capture. {notation}", True, BLACK), (27 ,status_y(150)))
                 read_aloud(f"en passant capture. {notation}")
         else:
             new_board[end[0]-1][end[1]] = ""
             if show_simulation and real_board:
                 print(f"Simulated en passant capture. {notation}.")
             if real_board:
-                pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 150, SCREEN_WIDTH - 50,50))
-                screen.blit(font.render(f"en passant capture. {notation}", True, BLACK), (27 ,SCREEN_HEIGHT - 150))
+                pygame.draw.rect(screen, WHITE, (25, status_y(150), SCREEN_WIDTH - 50,50))
+                screen.blit(font.render(f"en passant capture. {notation}", True, BLACK), (27 ,status_y(150)))
                 read_aloud(f"en passant capture. {notation}")
             
     # Handle castling
@@ -774,8 +784,8 @@ def simulate_move(board, move, real_board=False):
             if show_simulation and real_board:
                 print(f"Simulated {piece_dict[color]} castling.")
             if real_board:
-                pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 195, SCREEN_WIDTH - 50,50))
-                screen.blit(font_info.render(f"{piece_dict[color]} king-side castling.", True, BLACK), (27, SCREEN_HEIGHT - 195))
+                pygame.draw.rect(screen, WHITE, (25, status_y(195), SCREEN_WIDTH - 50,50))
+                screen.blit(font_info.render(f"{piece_dict[color]} king-side castling.", True, BLACK), (27, status_y(195)))
                 read_aloud(f"{piece_dict[color]} king-side castling.")
         elif end[1] == start[1]-2:  # Queen-side castling
             new_board[start[0]][start[1]-1] = color + 'R1'
@@ -783,8 +793,8 @@ def simulate_move(board, move, real_board=False):
             if show_simulation and real_board:
                 print(f"Simulated {piece_dict[color]} castling.")   
             if real_board:
-                pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 195, SCREEN_WIDTH - 50, 50))
-                screen.blit(font_info.render(f"{piece_dict[color]} queen-side castling.", True, BLACK), (27, SCREEN_HEIGHT - 195))
+                pygame.draw.rect(screen, WHITE, (25, status_y(195), SCREEN_WIDTH - 50, 50))
+                screen.blit(font_info.render(f"{piece_dict[color]} queen-side castling.", True, BLACK), (27, status_y(195)))
                 read_aloud(f"{piece_dict[color]} queen-side castling.")
 
     # Capture logic 
@@ -795,8 +805,8 @@ def simulate_move(board, move, real_board=False):
             else:
                 print(f"Simulated {piece} captures {captured_piece} at {end}")
         if real_board:
-            pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 195, SCREEN_WIDTH - 50,50))
-            screen.blit(font.render(f"{piece_dict[piece]} captures {piece_dict [captured_piece]}", True, BLACK), (27, SCREEN_HEIGHT - 195))
+            pygame.draw.rect(screen, WHITE, (25, status_y(195), SCREEN_WIDTH - 50,50))
+            screen.blit(font.render(f"{piece_dict[piece]} captures {piece_dict [captured_piece]}", True, BLACK), (27, status_y(195)))
             read_aloud(f"{piece_dict[piece]} captures {piece_dict [captured_piece]}")
    
     # Perform the move
@@ -1564,8 +1574,8 @@ def start_llm_picker(for_color):
         for d in dirs:
             print(f"  {d}")
         print("Copy a checkpoint into Chess_LLM_models/ or wait for training to save one.")
-        pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 50, SCREEN_WIDTH - 50, 50))
-        screen.blit(font_info.render("No .pth found — press H. Training saves are under Data/Chess_Model_*", True, BLACK), (27, SCREEN_HEIGHT - 50))
+        pygame.draw.rect(screen, WHITE, (25, status_y(50), SCREEN_WIDTH - 50, 50))
+        screen.blit(font_info.render("No .pth found — press H. Training saves are under Data/Chess_Model_*", True, BLACK), (27, status_y(50)))
         pygame.display.flip()
         return
     print(f"Newest checkpoint: {os.path.basename(paths[0])}")
@@ -1674,6 +1684,7 @@ def select_best_ai_move_llm(board, depth, color, AI_color, alpha=float('-inf'), 
                     # Plain English when we skip the move-picker's #1 for a better win guess
                     picked_uci, _, _ = scored[0]
                     if picked_uci != policy_first:
+                        llm_stats['value_overrides'] += 1
                         # Original place in the LLM's legal list (1=first, 2=second, ...)
                         orig_place = next(i + 1 for i, c in enumerate(legal_cands) if c[0] == picked_uci)
                         place_word = {1: "1st", 2: "2nd", 3: "3rd"}.get(orig_place, f"{orig_place}th")
@@ -2379,8 +2390,8 @@ def play_moves(board, moves, max_depth):
     print("Finished playing all moves")  # Debug print
     show_simulation = False    
     pygame.time.wait(time_delay)
-    pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 50, SCREEN_WIDTH - 50,50))
-    screen.blit(font_info.render(f"Move: {move_number}. Player: {player}.  Ai: {ai_method}. {depth_equation}", True, BLACK), (27, 650))
+    pygame.draw.rect(screen, WHITE, (25, status_y(50), SCREEN_WIDTH - 50,50))
+    screen.blit(font_info.render(f"Move: {move_number}. Player: {player}.  Ai: {ai_method}. {depth_equation}", True, BLACK), (27, status_y(50)))
     return board
 
 
@@ -2410,7 +2421,7 @@ def initialize_game():
     global setauto_switch_colors_for_player, depth_formula,transposition_table, depth_equation,discount,player_turn, selected_piece, actual_last_move, \
         list_of_boards, move_number, end_of_game, running, show_simulation, board, depth, player,ai, evaluate_board, evaluation_method, \
             select_best_ai_move, ai_method, ai_method_white, ai_method_black, has_moved, auto_save, game_history, game_history_simple, position_history, board_reversed, sound_enabled, has_moved_history, \
-            llm_picker_for, llm_picker_page, llm_picker_paths, history_index, last_move_history
+            llm_picker_for, llm_picker_page, llm_picker_paths, history_index, last_move_history, llm_stats
     # The initial board setup, simplified without pawn promotion
     board = initial_board
     player_turn = True
@@ -2467,12 +2478,12 @@ def initialize_game():
     draw_board_wrapper(screen, board)
     draw_pieces_not_on_board(screen,board, height=SCREEN_HEIGHT)
     pygame.display.set_caption("JMR's Game of Chess")
-    pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 200, SCREEN_WIDTH - 50,200))
+    pygame.draw.rect(screen, WHITE, (25, status_y(200), SCREEN_WIDTH - 50,200))
     screen.blit(font_info.render(
         f"Move: {move_number}. Player: {player}.  W: {friendly_ai_method_display(ai_method_white)}  "
         f"B: {friendly_ai_method_display(ai_method_black)}.  {depth_equation}",
-        True, BLACK), (27, SCREEN_HEIGHT - 150))
-    screen.blit(font_info.render(f"Depth: {depth}. Evaluation Method {evaluation_method}. Show simulation: {show_simulation}", True, BLACK), (27, SCREEN_HEIGHT - 125))
+        True, BLACK), (27, status_y(150)))
+    screen.blit(font_info.render(f"Depth: {depth}. Evaluation Method {evaluation_method}. Show simulation: {show_simulation}", True, BLACK), (27, status_y(125)))
     pygame.display.flip()
 
     # LLM models are loaded on-demand when switching to LLM mode
@@ -2483,7 +2494,8 @@ def initialize_game():
         'first_legal': 0,
         'second_legal': 0,
         'third_plus_legal': 0,
-        'no_legal': 0
+        'no_legal': 0,
+        'value_overrides': 0,
     }
 
 
@@ -2506,9 +2518,10 @@ depth_equations = {
     }
 
 def help():
-    # Draw entirely BELOW the board so it never covers pieces
+    # Sit in the extended white strip under the board (never cover pieces).
+    # Prefer the bottom of the window so status lines stay visible above when possible.
     help_h = 300
-    y0 = BOARD_PIXEL_H + 8
+    y0 = max(BOARD_PIXEL_H + 8, SCREEN_HEIGHT - help_h - 8)
     pygame.draw.rect(screen, WHITE, (25, y0, SCREEN_WIDTH - 50, help_h))
 
     small_font = pygame.font.SysFont("Arial", 18)
@@ -2642,14 +2655,14 @@ while running:
                 pygame.time.wait(100)
                 draw_board_wrapper(screen, board)
                 draw_pieces_not_on_board(screen, board, height=SCREEN_HEIGHT)
-                pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 150, SCREEN_WIDTH - 50, 50))
+                pygame.draw.rect(screen, WHITE, (25, status_y(150), SCREEN_WIDTH - 50, 50))
                 screen.blit(font_info.render(
                     f"Move: {move_number}. Player: {player}.  W: {friendly_ai_method_display(ai_method_white)}  "
                     f"B: {friendly_ai_method_display(ai_method_black)}.  {depth_equation}",
-                    True, BLACK), (27, SCREEN_HEIGHT - 150))
+                    True, BLACK), (27, status_y(150)))
                 screen.blit(font_info.render(
                     f"Depth: {depth}. Evaluation: {evaluation_method}. Simulation: {'On' if show_simulation else 'Off'}",
-                    True, BLACK), (27, SCREEN_HEIGHT - 125))
+                    True, BLACK), (27, status_y(125)))
                 draw_llm_picker_overlay(screen)
                 pygame.display.flip()
                 continue
@@ -2771,8 +2784,8 @@ while running:
             if event.key == pygame.K_s:
                 print("Saving game...", board)
                 #just draw white where the text will be
-                pygame.draw.rect(screen, WHITE, (27, SCREEN_HEIGHT - 75, 200, 50))  
-                screen.blit(font_info.render("Saving game...", True, BLACK), (27, SCREEN_HEIGHT - 75))
+                pygame.draw.rect(screen, WHITE, (27, status_y(75), 200, 50))  
+                screen.blit(font_info.render("Saving game...", True, BLACK), (27, status_y(75)))
                 read_aloud("Saving game")
                 save_game(board, move_number, player, ai, depth, evaluation_method, ai_method_white, ai_method_black, depth_equation, show_simulation, list_of_boards, position_history, has_moved_history, game_history, game_history_simple)
             
@@ -2789,8 +2802,8 @@ while running:
                     board = old_board
                     print("No game loaded.")
                     #just draw white where the text will be
-                    pygame.draw.rect(screen, WHITE, (27, SCREEN_HEIGHT - 75, 200, 50))      
-                    screen.blit(font_info.render("No game loaded.", True, BLACK), (27, SCREEN_HEIGHT - 75))
+                    pygame.draw.rect(screen, WHITE, (27, status_y(75), 200, 50))      
+                    screen.blit(font_info.render("No game loaded.", True, BLACK), (27, status_y(75)))
                     read_aloud("No game loaded")
                 else:
                     try:
@@ -2828,12 +2841,12 @@ while running:
                     except:
                         print("Error loading game.")
                         #just draw white where the text will be
-                        pygame.draw.rect(screen, WHITE, (27, SCREEN_HEIGHT - 75, 200, 50))  
-                        screen.blit(font_info.render("Error loading game.", True, BLACK), (27, SCREEN_HEIGHT - 75))
+                        pygame.draw.rect(screen, WHITE, (27, status_y(75), 200, 50))  
+                        screen.blit(font_info.render("Error loading game.", True, BLACK), (27, status_y(75)))
                         read_aloud("Error loading game")
                     print("Loaded game...", board)
-                    pygame.draw.rect(screen, WHITE, (27, SCREEN_HEIGHT - 75, 200, 50))    
-                    screen.blit(font_info.render("Loaded game...", True, BLACK), (27, SCREEN_HEIGHT - 75))
+                    pygame.draw.rect(screen, WHITE, (27, status_y(75), 200, 50))    
+                    screen.blit(font_info.render("Loaded game...", True, BLACK), (27, status_y(75)))
                     read_aloud("Loaded game")
                 pygame.display.set_caption("JMR's Game of Chess Game")
                     
@@ -2868,7 +2881,7 @@ while running:
                 board_reversed = not board_reversed
                 print(f"Board view reversed: {'Black' if board_reversed else 'White'} on bottom")
                 read_aloud(f"Board view reversed: {'Black' if board_reversed else 'White'} on bottom")  
-                pygame.draw.rect(screen, WHITE, (0,0,SCREEN_WIDTH,SCREEN_HEIGHT -200))
+                pygame.draw.rect(screen, WHITE, (0,0,SCREEN_WIDTH,status_y(200)))
                 draw_board_wrapper(screen, board)
                 draw_pieces_not_on_board(screen, board, height=SCREEN_HEIGHT)
                 pygame.display.flip()
@@ -2881,7 +2894,7 @@ while running:
                 pygame.draw.rect(screen, WHITE, (0,0,SCREEN_WIDTH,SCREEN_HEIGHT))
                 print("Switching to 2D display mode.")
                 read_aloud("Switching to 2D display mode.")
-                pygame.draw.rect(screen, WHITE, (0,0,SCREEN_WIDTH,SCREEN_HEIGHT - 200)) 
+                pygame.draw.rect(screen, WHITE, (0,0,SCREEN_WIDTH,status_y(200))) 
                 draw_board_wrapper(screen, board)
                 pygame.display.flip()
 
@@ -2893,7 +2906,7 @@ while running:
                 pygame.draw.rect(screen, WHITE, (0,0,SCREEN_WIDTH,SCREEN_HEIGHT))
                 print("Switching to 3D display mode.")
                 read_aloud("Switching to 3D display mode.")
-                pygame.draw.rect(screen, WHITE, (0,0,SCREEN_WIDTH,SCREEN_HEIGHT - 200)) 
+                pygame.draw.rect(screen, WHITE, (0,0,SCREEN_WIDTH,status_y(200))) 
                 draw_board_wrapper(screen, board)
                 pygame.display.flip()
 
@@ -2908,12 +2921,12 @@ while running:
 
             pygame.time.wait(100)
             redraw_board_with_selection()
-            pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 150, SCREEN_WIDTH - 50,50))
+            pygame.draw.rect(screen, WHITE, (25, status_y(150), SCREEN_WIDTH - 50,50))
             screen.blit(font_info.render(
                 f"Move: {move_number}. Player: {player}.  W: {friendly_ai_method_display(ai_method_white)}  "
                 f"B: {friendly_ai_method_display(ai_method_black)}.  {depth_equation}",
-                True, BLACK), (27, SCREEN_HEIGHT - 150))
-            screen.blit(font_info.render(f"Depth: {depth}. Evaluation: {evaluation_method}. Simulation: {'On' if show_simulation else 'Off'}", True, BLACK), (27, SCREEN_HEIGHT - 125))
+                True, BLACK), (27, status_y(150)))
+            screen.blit(font_info.render(f"Depth: {depth}. Evaluation: {evaluation_method}. Simulation: {'On' if show_simulation else 'Off'}", True, BLACK), (27, status_y(125)))
             draw_llm_picker_overlay(screen)
 
             pygame.display.flip()
@@ -2943,8 +2956,8 @@ while running:
                                 # Process the move
                                 to_notation = f"{chr(97 + pos[1])}{8 - pos[0]}"
                                 from_notation = f"{chr(97 + selected_piece[1])}{8 - selected_piece[0]}"
-                                pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 25, SCREEN_WIDTH - 50, 25))
-                                screen.blit(font_info.render(f"From: {from_notation} To: {to_notation}", True, BLACK), (27, SCREEN_HEIGHT - 25))
+                                pygame.draw.rect(screen, WHITE, (25, status_y(25), SCREEN_WIDTH - 50, 25))
+                                screen.blit(font_info.render(f"From: {from_notation} To: {to_notation}", True, BLACK), (27, status_y(25)))
                                 pygame.display.flip()
                                 
                                 notation = convert_to_standard_notation(board, move)
@@ -2953,9 +2966,9 @@ while running:
                                 game_history_simple.append(notation_simple) 
                                 piece = board[selected_piece[0]][selected_piece[1]]
                                 print(f"Player moves: {piece} {move}")
-                                pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 100, SCREEN_WIDTH - 50,50))
+                                pygame.draw.rect(screen, WHITE, (25, status_y(100), SCREEN_WIDTH - 50,50))
                                 
-                                screen.blit(font_info.render("Player moves: "+notation, True, BLACK), (27, SCREEN_HEIGHT - 100))
+                                screen.blit(font_info.render("Player moves: "+notation, True, BLACK), (27, status_y(100)))
                                 board = simulate_move(board, move, real_board=True)
                                 position_history.append(board_to_hashable(board, ai))  # AI moves next
                                 actual_last_move = move #Track the last move
@@ -2975,8 +2988,8 @@ while running:
                                 # Check for checkmate and other game-ending conditions here
                                 if is_checkmate(board, ai):
                                     print(f"Checkmate. {piece_dict[player]} wins.")
-                                    pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 50, SCREEN_WIDTH - 50, 50))
-                                    screen.blit(font.render(f"Checkmate. {piece_dict[player]} wins.", True, BLACK), (27, SCREEN_HEIGHT - 50))
+                                    pygame.draw.rect(screen, WHITE, (25, status_y(50), SCREEN_WIDTH - 50, 50))
+                                    screen.blit(font.render(f"Checkmate. {piece_dict[player]} wins.", True, BLACK), (27, status_y(50)))
                                     read_aloud(f"Checkmate. {piece_dict[player]} wins.")
                                     end_of_game = True
                                     pygame.display.flip() 
@@ -2990,8 +3003,8 @@ while running:
                                             if event.type == pygame.KEYDOWN:
                                                 if event.key == pygame.K_d:
                                                     print("Draw claimed. Game over.")
-                                                    pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 50, SCREEN_WIDTH - 50, 50))
-                                                    screen.blit(font.render("Draw claimed. Game over.", True, BLACK), (27, SCREEN_HEIGHT - 50))
+                                                    pygame.draw.rect(screen, WHITE, (25, status_y(50), SCREEN_WIDTH - 50, 50))
+                                                    screen.blit(font.render("Draw claimed. Game over.", True, BLACK), (27, status_y(50)))
                                                     read_aloud("Draw claimed. Game over.")
                                                     end_of_game = True
                                                 else:
@@ -3003,14 +3016,14 @@ while running:
                                 # Clicked another own piece — switch selection and show its moves
                                 selected_piece = pos
                                 from_notation = f"{chr(97 + pos[1])}{8 - pos[0]}"
-                                pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 25, SCREEN_WIDTH - 50, 25))
-                                screen.blit(font_info.render(f"From: {from_notation}", True, BLACK), (27, SCREEN_HEIGHT - 25))
+                                pygame.draw.rect(screen, WHITE, (25, status_y(25), SCREEN_WIDTH - 50, 25))
+                                screen.blit(font_info.render(f"From: {from_notation}", True, BLACK), (27, status_y(25)))
                                 redraw_board_with_selection()
                                 pygame.display.flip()
                             else:
                                 print("Illegal move")
-                                pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 50, SCREEN_WIDTH - 50,50))
-                                screen.blit(font_info.render("Illegal move", True, BLACK), (27, SCREEN_HEIGHT - 50))
+                                pygame.draw.rect(screen, WHITE, (25, status_y(50), SCREEN_WIDTH - 50,50))
+                                screen.blit(font_info.render("Illegal move", True, BLACK), (27, status_y(50)))
                                 selected_piece = None
                                 redraw_board_with_selection()
                                 pygame.display.flip()
@@ -3018,35 +3031,35 @@ while running:
                             if board[pos[0]][pos[1]] and board[pos[0]][pos[1]].startswith(player):
                                 selected_piece = pos
                                 from_notation = f"{chr(97 + pos[1])}{8 - pos[0]}"
-                                pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 25, SCREEN_WIDTH - 50, 25))
-                                screen.blit(font_info.render(f"From: {from_notation}", True, BLACK), (27, SCREEN_HEIGHT - 25))
+                                pygame.draw.rect(screen, WHITE, (25, status_y(25), SCREEN_WIDTH - 50, 25))
+                                screen.blit(font_info.render(f"From: {from_notation}", True, BLACK), (27, status_y(25)))
                                 redraw_board_with_selection()
                                 pygame.display.flip()
                             else:
                                 selected_piece = None
-                                pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 25, SCREEN_WIDTH - 50, 25))
-                                screen.blit(font_info.render("Select a valid piece", True, BLACK), (27, SCREEN_HEIGHT - 25))
+                                pygame.draw.rect(screen, WHITE, (25, status_y(25), SCREEN_WIDTH - 50, 25))
+                                screen.blit(font_info.render("Select a valid piece", True, BLACK), (27, status_y(25)))
                                 redraw_board_with_selection()
                                 pygame.display.flip()
                     else:
                         print("Clicked outside the board")
-                        pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 50, SCREEN_WIDTH - 50,50))
-                        screen.blit(font_info.render("Clicked outside the board", True, BLACK), (27, SCREEN_HEIGHT - 50))
+                        pygame.draw.rect(screen, WHITE, (25, status_y(50), SCREEN_WIDTH - 50,50))
+                        screen.blit(font_info.render("Clicked outside the board", True, BLACK), (27, status_y(50)))
                 else:
                     print("No legal moves for Player")
                     print("Stalemate.")
-                    pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 200, SCREEN_WIDTH - 50,200))
-                    screen.blit(font.render(f"No legal moves for {piece_dict[player]} Player  ", True, BLACK), (27, SCREEN_HEIGHT - 200))
-                    screen.blit(font.render("Stalemate.", True, BLACK), (27, SCREEN_HEIGHT - 150))
+                    pygame.draw.rect(screen, WHITE, (25, status_y(200), SCREEN_WIDTH - 50,200))
+                    screen.blit(font.render(f"No legal moves for {piece_dict[player]} Player  ", True, BLACK), (27, status_y(200)))
+                    screen.blit(font.render("Stalemate.", True, BLACK), (27, status_y(150)))
                     pygame.display.flip()
                     read_aloud(f"No legal moves for {piece_dict[player]} AI  ")
                     read_aloud("Stalemate.")
                     end_of_game = True
 
             # Update display after each click
-            #pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 150, SCREEN_WIDTH - 50,50))
-            #screen.blit(font_info.render(f"Move: {move_number}. Player: {player}.  Ai: {ai_method}. {depth_equation}", True, BLACK), (27, SCREEN_HEIGHT - 150))
-            #screen.blit(font_info.render(f"Depth: {depth}. Evaluation: {evaluation_method}. Show simulation: {show_simulation}", True, BLACK), (27, SCREEN_HEIGHT - 125))
+            #pygame.draw.rect(screen, WHITE, (25, status_y(150), SCREEN_WIDTH - 50,50))
+            #screen.blit(font_info.render(f"Move: {move_number}. Player: {player}.  Ai: {ai_method}. {depth_equation}", True, BLACK), (27, status_y(150)))
+            #screen.blit(font_info.render(f"Depth: {depth}. Evaluation: {evaluation_method}. Show simulation: {show_simulation}", True, BLACK), (27, status_y(125)))
             pygame.display.flip()
 
     # AI Turn Processing Section
@@ -3080,13 +3093,13 @@ while running:
 
         # ai_method is already set above for self-play
         print(f"AI {piece_dict[ai]} {friendly_ai_method_display(ai_method)} is thinking...")
-        pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 200, SCREEN_WIDTH - 50,100))
-        screen.blit(font.render(f"AI {piece_dict[ai]} {friendly_ai_method_display(ai_method)} is thinking...", True, BLACK), (27, SCREEN_HEIGHT - 200))
+        pygame.draw.rect(screen, WHITE, (25, status_y(200), SCREEN_WIDTH - 50,100))
+        screen.blit(font.render(f"AI {piece_dict[ai]} {friendly_ai_method_display(ai_method)} is thinking...", True, BLACK), (27, status_y(200)))
         screen.blit(font_info.render(
             f"Move: {move_number}. Player: {player}.  W: {friendly_ai_method_display(ai_method_white)}  "
             f"B: {friendly_ai_method_display(ai_method_black)}.  {depth_equation}",
-            True, BLACK), (27, SCREEN_HEIGHT - 150))
-        screen.blit(font_info.render(f"Depth: {depth}. Evaluation: {evaluation_method}. Simulation: {'On' if show_simulation else 'Off'}", True, BLACK), (27, SCREEN_HEIGHT - 125))
+            True, BLACK), (27, status_y(150)))
+        screen.blit(font_info.render(f"Depth: {depth}. Evaluation: {evaluation_method}. Simulation: {'On' if show_simulation else 'Off'}", True, BLACK), (27, status_y(125)))
         pygame.display.flip()
         # Keep the TT across moves (transpositions); only drop it if it grew past TT_MAX_ENTRIES
         print(f"Transposition table size: {len(transposition_table)}")
@@ -3122,15 +3135,15 @@ while running:
             if is_in_check(board, ai):
                 # Checkmate - player wins
                 print(f"Checkmate. {piece_dict[player]} player wins.")
-                pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 50, SCREEN_WIDTH - 50,50))
-                screen.blit(font.render(f"Checkmate. {piece_dict[player]} player wins.", True, BLACK), (27, SCREEN_HEIGHT - 50))
+                pygame.draw.rect(screen, WHITE, (25, status_y(50), SCREEN_WIDTH - 50,50))
+                screen.blit(font.render(f"Checkmate. {piece_dict[player]} player wins.", True, BLACK), (27, status_y(50)))
                 read_aloud(f"Checkmate. {piece_dict[player]} player wins.")
                 pygame.display.flip()
             else:
                 # Stalemate - draw
                 print("Stalemate. Game is a draw.")
-                pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 50, SCREEN_WIDTH - 50,50))
-                screen.blit(font.render("Stalemate. Game is a draw.", True, BLACK), (27, SCREEN_HEIGHT - 50))
+                pygame.draw.rect(screen, WHITE, (25, status_y(50), SCREEN_WIDTH - 50,50))
+                screen.blit(font.render("Stalemate. Game is a draw.", True, BLACK), (27, status_y(50)))
                 read_aloud("Stalemate. Game is a draw.")
                 pygame.display.flip()
 
@@ -3150,13 +3163,16 @@ while running:
             piece = board[new_position[0]][new_position[1]]
             last_board = copy.deepcopy(board) # for movie playback reducant with list of boards but good for now
             board = simulate_move(board, selected_move, real_board=True)
-            position_history.append(board_to_hashable(board, player))  # Player moves next
-            board_hash = board_to_hashable(board, player)
+            # Next side to move (NOT global `player` — in self-play `player` stays "W",
+            # which broke threefold / anti-shuffle Search while White was winning).
+            next_stm = "B" if ai == "W" else "W"
+            position_history.append(board_to_hashable(board, next_stm))
+            board_hash = board_to_hashable(board, next_stm)
             end_time = time.time()
             print(f"AI selects move: {piece} {selected_move}, eval score: {eval_score:.2f}, time: {end_time - start_time:.2f} seconds, moves considered: {len(transposition_table)}, paths: {len(movie_moves)}")
             print(f"Move made - move_number: {move_number}, boards: {len(list_of_boards)}, history: {len(game_history)}")
-            pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 75, SCREEN_WIDTH - 50,25))
-            screen.blit(font_info.render(f"AI: {notation}, {optionalisitLLMmove}, Ev: {eval_score:.2f}, Moves considered: {len(transposition_table)}, Time: {end_time - start_time:.0f}, Path: {len(movie_moves)} ", True, BLACK), (27, SCREEN_HEIGHT - 75))
+            pygame.draw.rect(screen, WHITE, (25, status_y(75), SCREEN_WIDTH - 50,25))
+            screen.blit(font_info.render(f"AI: {notation}, {optionalisitLLMmove}, Ev: {eval_score:.2f}, Moves considered: {len(transposition_table)}, Time: {end_time - start_time:.0f}, Path: {len(movie_moves)} ", True, BLACK), (27, status_y(75)))
             actual_last_move = selected_move #Track the last move added to use one call for both making and simulating.
             draw_board_wrapper(screen, board)
             draw_pieces_not_on_board(screen, board, height=SCREEN_HEIGHT)
@@ -3168,8 +3184,8 @@ while running:
         else:
             # AI couldn't find any moves - this shouldn't happen in normal play
             print(f"AI {piece_dict[ai]} found no valid moves!")
-            pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 75, SCREEN_WIDTH - 50,25))
-            screen.blit(font_info.render(f"AI {piece_dict[ai]}: No moves found!", True, BLACK), (27, SCREEN_HEIGHT - 75))
+            pygame.draw.rect(screen, WHITE, (25, status_y(75), SCREEN_WIDTH - 50,25))
+            screen.blit(font_info.render(f"AI {piece_dict[ai]}: No moves found!", True, BLACK), (27, status_y(75)))
             pygame.display.flip()
             end_of_game = True
             continue
@@ -3188,24 +3204,24 @@ while running:
             if not setauto_switch_colors_for_player:
                 player_turn = True
             if is_in_check(board, player):
-                pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 200, SCREEN_WIDTH - 50,50))
+                pygame.draw.rect(screen, WHITE, (25, status_y(200), SCREEN_WIDTH - 50,50))
                 print(f"{piece_dict[player]} player  is in check.")
-                screen.blit(font.render(f"{player} is in check.", True, BLACK), (27, SCREEN_HEIGHT - 200))
+                screen.blit(font.render(f"{player} is in check.", True, BLACK), (27, status_y(200)))
                 if not setauto_switch_colors_for_player:
                     read_aloud(f"{piece_dict[player]} is in check.")
                 pygame.display.flip()
             if is_checkmate(board, player):
                 print(f"Checkmate. AI {piece_dict[ai]} wins.")
-                pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 50, SCREEN_WIDTH - 50,50))    
-                screen.blit(font.render(f"Checkmate. {piece_dict[ai]} AI wins.", True, BLACK), (27, SCREEN_HEIGHT - 50))
+                pygame.draw.rect(screen, WHITE, (25, status_y(50), SCREEN_WIDTH - 50,50))    
+                screen.blit(font.render(f"Checkmate. {piece_dict[ai]} AI wins.", True, BLACK), (27, status_y(50)))
                 if not setauto_switch_colors_for_player:
                     read_aloud(f"Checkmate. {piece_dict[ai]} AI wins.")
                 end_of_game = True
                 pygame.display.flip() 
             if is_automatic_draw():
                 print("Fivefold repetition. Automatic draw.")
-                pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 50, SCREEN_WIDTH - 50,50))    
-                screen.blit(font.render("Fivefold repetition. Game is a draw.", True, BLACK), (27, SCREEN_HEIGHT - 50))
+                pygame.draw.rect(screen, WHITE, (25, status_y(50), SCREEN_WIDTH - 50,50))    
+                screen.blit(font.render("Fivefold repetition. Game is a draw.", True, BLACK), (27, status_y(50)))
                 if not setauto_switch_colors_for_player:
                     read_aloud("Fivefold repetition. Game is a draw.")
                 end_of_game = True
@@ -3214,17 +3230,17 @@ while running:
                 print ("Can claim draw")
                 if ai_should_claim_draw(board, ai):
                     print("Threefold repetition. AI claims draw.")
-                    pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 50, SCREEN_WIDTH - 50, 50))    
+                    pygame.draw.rect(screen, WHITE, (25, status_y(50), SCREEN_WIDTH - 50, 50))    
                     #specify the color of the AI
-                    screen.blit(font.render(f"Threefold repetition. {piece_dict[ai]} AI claims draw.", True, BLACK), (27, SCREEN_HEIGHT - 50))
+                    screen.blit(font.render(f"Threefold repetition. {piece_dict[ai]} AI claims draw.", True, BLACK), (27, status_y(50)))
                     if not setauto_switch_colors_for_player:
                         read_aloud("Threefold repetition. AI claims draw. Game over.")
                     end_of_game = True
                     pygame.display.flip()
                 else:
                     print("AI chooses not to claim draw.")
-                    pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 50, SCREEN_WIDTH - 50, 50))    
-                    screen.blit(font.render("AI chooses not to claim draw.", True, BLACK), (27, SCREEN_HEIGHT - 50))
+                    pygame.draw.rect(screen, WHITE, (25, status_y(50), SCREEN_WIDTH - 50, 50))    
+                    screen.blit(font.render("AI chooses not to claim draw.", True, BLACK), (27, status_y(50)))
                     if not setauto_switch_colors_for_player:
                         read_aloud("AI chooses not to claim draw.")
                     pygame.display.flip()
@@ -3232,9 +3248,9 @@ while running:
         else:
             print("No legal moves for AI")
             print("Stalemate.")
-            pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 200, SCREEN_WIDTH - 50,200))
-            screen.blit(font.render(f"No legal moves for {piece_dict[ai]} AI  ", True, BLACK), (27, SCREEN_HEIGHT - 200))
-            screen.blit(font.render("Stalemate.", True, BLACK), (27, SCREEN_HEIGHT - 150))
+            pygame.draw.rect(screen, WHITE, (25, status_y(200), SCREEN_WIDTH - 50,200))
+            screen.blit(font.render(f"No legal moves for {piece_dict[ai]} AI  ", True, BLACK), (27, status_y(200)))
+            screen.blit(font.render("Stalemate.", True, BLACK), (27, status_y(150)))
             pygame.display.flip()
             read_aloud(f"No legal moves for {piece_dict[ai]} AI  ")
             read_aloud("Stalemate.")
@@ -3243,12 +3259,12 @@ while running:
     if end_of_game:
         if not auto_save:
             print("Saving game...", board)
-            pygame.draw.rect(screen, WHITE, (25, SCREEN_HEIGHT - 75, SCREEN_WIDTH - 50,30))
-            screen.blit(font_info.render("Saving game...", True, BLACK), (27, SCREEN_HEIGHT - 75))
+            pygame.draw.rect(screen, WHITE, (25, status_y(75), SCREEN_WIDTH - 50,30))
+            screen.blit(font_info.render("Saving game...", True, BLACK), (27, status_y(75)))
             read_aloud("Saving game")
             save_game(board, move_number, player, ai, depth, evaluation_method, ai_method_white, ai_method_black, depth_equation, show_simulation, list_of_boards, position_history, has_moved_history, game_history, game_history_simple)
 
-            # Display LLM move statistics
+            # Display LLM move statistics (console + on-screen)
             if llm_stats['total_moves'] > 0:
                 print("\n=== LLM Move Statistics ===")
                 print(f"Total LLM moves: {llm_stats['total_moves']}")
@@ -3256,6 +3272,13 @@ while running:
                 print(f"Second response legal: {llm_stats['second_legal']} times")
                 print(f"Third+ response legal: {llm_stats['third_plus_legal']} times")
                 print(f"No legal moves found: {llm_stats['no_legal']} times")
+                print(f"Win-guesser overrode 1st pick: {llm_stats['value_overrides']} times")
+                # On-screen report under the move/status lines
+                pygame.draw.rect(screen, WHITE, (25, status_y(100), SCREEN_WIDTH - 50, 50))
+                screen.blit(font_info.render(
+                    f"Win-guesser skipped 1st pick for better outcome: {llm_stats['value_overrides']} times "
+                    f"(of {llm_stats['total_moves']} Neural moves)",
+                    True, BLACK), (27, status_y(100)))
 
             read_aloud("Hit 'r' to restart the game.")
             pygame.display.set_caption("Hit 'r' to restart the game.")

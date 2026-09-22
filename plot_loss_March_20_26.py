@@ -177,67 +177,70 @@ def scan_checkpoints_with_history(folder_path):
 
     return merged_checkpoints
 
+def build_continuous_x(checkpoints):
+    """
+    Epoch-like x-axis with no visual gaps.
+
+    Uses max batch index as batches-per-epoch (e.g. ~20k), not a hardcoded 60k
+    (that made E1 end near 1.33 then jump to E2 at 2.0 — the long flat “gap”).
+
+    When a new parquet reload restarts epoch at E1, the axis continues forward
+    from the last point instead of jumping backward or leaving a hole.
+    """
+    if not checkpoints:
+        return []
+
+    bpe = float(max(cp[1] for cp in checkpoints) or 1)
+    xs = []
+    session_offset = 0.0
+    prev_e = prev_b = None
+
+    for epoch, batch, _loss, _mtime, _fn in checkpoints:
+        local = (epoch - 1) + (batch / bpe)
+        if prev_e is not None and (epoch < prev_e or (epoch == prev_e and batch < prev_b)):
+            session_offset = xs[-1]
+        x = session_offset + local
+        if xs and x <= xs[-1]:
+            x = xs[-1] + (1.0 / bpe)
+        xs.append(x)
+        prev_e, prev_b = epoch, batch
+
+    return xs
+
+
 def plot_loss_progression(checkpoints, folder_name):
     """
-    Plot loss progression from checkpoint data.
+    Plot loss progression from checkpoint data (mtime order, continuous x).
     """
     if not checkpoints:
         print("No valid checkpoints found!")
         return
 
-    # Extract data for plotting
-    epochs = [cp[0] for cp in checkpoints]
-    batches = [cp[1] for cp in checkpoints]
     losses = [cp[2] for cp in checkpoints]
+    x_values = build_continuous_x(checkpoints)
 
-    # Create combined x-axis that never backtracks
-    # Track cumulative batch count across all epochs
-    x_values = []
-    cumulative_batch = 0
-    last_epoch = epochs[0]
-    
-    for epoch, batch in zip(epochs, batches):
-        # When epoch changes, we continue from where we left off (no reset)
-        # Just use the current batch number as offset for this epoch
-        if epoch != last_epoch:
-            # Epoch changed - this is expected, just continue forward
-            last_epoch = epoch
-        
-        # Progressive x-axis: each checkpoint gets the next sequential position
-        x_values.append(cumulative_batch / 1000.0)  # Scale for readability
-        cumulative_batch += 1
-
-    # Create the plot
-    
     plt.figure(figsize=(12, 6))
 
-    # Plot loss over time
     plt.subplot(1, 2, 1)
     plt.plot(x_values, losses, 'b-', marker='o', markersize=3, linewidth=1)
-    plt.xlabel('Training Progress (x1000 checkpoints)')
+    plt.xlabel('Training progress (epoch units, continuous across data reloads)')
     plt.ylabel('Loss')
     plt.title(f'Loss Progression - {folder_name}')
     plt.grid(True, alpha=0.3)
 
-    # Plot smoothed loss with sliding window average of last 50 losses
     plt.subplot(1, 2, 2)
-
-    # Calculate sliding window average with window size 50
-    window_size = 50
+    window_size = min(50, len(losses))
     smoothed_losses = []
     smoothed_x = []
-
     for i in range(len(losses)):
         if i >= window_size - 1:
-            # Calculate average of last 50 losses
-            window_avg = sum(losses[i-window_size+1:i+1]) / window_size
+            window_avg = sum(losses[i - window_size + 1:i + 1]) / window_size
             smoothed_losses.append(window_avg)
             smoothed_x.append(x_values[i])
 
-    # Plot the smoothed losses as red line
     plt.plot(smoothed_x, smoothed_losses, 'r-', linewidth=2)
-    plt.xlabel('Training Progress (x1000 checkpoints)')
-    plt.ylabel('Smoothed Loss (50-point average)')
+    plt.xlabel('Training progress (epoch units, continuous across data reloads)')
+    plt.ylabel(f'Smoothed Loss ({window_size}-point average)')
     plt.title(f'Smoothed Loss Progression - {folder_name}')
     plt.grid(True, alpha=0.3)
 
