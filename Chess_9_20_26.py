@@ -37,18 +37,16 @@ pygame.init()
 
 # Constants for the game
 SCREEN_WIDTH = 1200
-# Board is 8*150=1200 tall; extra strip below so help never covers pieces
-SCREEN_HEIGHT = 1540
+# Board is 8*150=1200. The bottom 200px is the captured-piece columns plus move/help text.
+# No extra white band above that strip (1540 left a gap; text belongs at the bottom).
+SCREEN_HEIGHT = 1400
 BOARD_SIZE = 8
 SQUARE_SIZE = SCREEN_WIDTH // BOARD_SIZE
-BOARD_PIXEL_H = BOARD_SIZE * SQUARE_SIZE  # top of the status strip (flush under board)
-# Status band height matches the old SCREEN_HEIGHT=1400 layout (1400-1200).
-# Extra window pixels below this band are for the help overlay only.
-STATUS_BAND_H = 200
+BOARD_PIXEL_H = BOARD_SIZE * SQUARE_SIZE  # y where the bottom strip starts
 
 def status_y(from_bottom):
-    """Y for status text: flush under board (not SCREEN_HEIGHT — that left a white gap)."""
-    return BOARD_PIXEL_H + STATUS_BAND_H - from_bottom
+    """Y in the bottom strip, measured up from the window bottom (with the captured pieces)."""
+    return SCREEN_HEIGHT - from_bottom
 
 GRAY = (128, 128, 128)
 BLACK = (0, 0, 0)
@@ -435,6 +433,8 @@ def save_game(board, move_number, player, ai, depth, evaluation_method, ai_metho
             "player": player,
             "ai": ai,
             "depth": depth,
+            "depth_white": depth_white,
+            "depth_black": depth_black,
             "evaluation_method": evaluation_method,
             "ai_method_white": ai_method_white,
             "ai_method_black": ai_method_black,
@@ -595,28 +595,68 @@ def get_all_legal_moves(board, color, last_move=None, check_legality=True, right
     legal_moves = [move for move in move_candidates if is_move_legal(board, move, color, rights=rights)]
     return legal_moves
 
+# Attack walk used by check and castling. Same geometry as get_moves_for_piece, but it
+# does not build a move list. Full movegen inside is_in_check was almost all of Search time
+# (depth 4 in the opening was 5–80s per move).
+_KNIGHT_DELTAS = ((-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1))
+_KING_DELTAS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
+_BISHOP_DIRS = ((-1, -1), (-1, 1), (1, -1), (1, 1))
+_ROOK_DIRS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+
+
+def _square_attacked(board, row, col, attacker_color):
+    """True if attacker_color attacks (row, col). Pawns attack diagonally only (not en passant)."""
+    # Pawn that would capture onto this square stands one step back (white moves toward row 0).
+    pawn_row = row + 1 if attacker_color == "W" else row - 1
+    if 0 <= pawn_row < BOARD_SIZE:
+        for dc in (-1, 1):
+            pc = col + dc
+            if 0 <= pc < BOARD_SIZE:
+                p = board[pawn_row][pc]
+                if p and p[0] == attacker_color and p[1] == "P":
+                    return True
+    for dr, dc in _KNIGHT_DELTAS:
+        r, c = row + dr, col + dc
+        if 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE:
+            p = board[r][c]
+            if p and p[0] == attacker_color and p[1] == "N":
+                return True
+    for dr, dc in _KING_DELTAS:
+        r, c = row + dr, col + dc
+        if 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE:
+            p = board[r][c]
+            if p and p[0] == attacker_color and p[1] == "K":
+                return True
+    for dirs, kinds in ((_BISHOP_DIRS, "BQ"), (_ROOK_DIRS, "RQ")):
+        for dr, dc in dirs:
+            r, c = row + dr, col + dc
+            while 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE:
+                p = board[r][c]
+                if p:
+                    if p[0] == attacker_color and p[1] in kinds:
+                        return True
+                    break
+                r += dr
+                c += dc
+    return False
+
+
 def is_in_check(board, color):
     # Find the king's position once and for all
-    king_position = next(((r, c) for r in range(BOARD_SIZE)
-                          for c in range(BOARD_SIZE)
-                          if board[r][c] == f"{color}K"), None)
-    # Get all moves for the opponent
-    opponent_color = "W" if color == "B" else "B"
-    opponent_moves = get_all_legal_moves(board, opponent_color, check_legality=False)
-    # See if any move attacks the king's position
-    return any(end == king_position for _, end in opponent_moves)
+    target = color + "K"
+    opponent_color = "B" if color == "W" else "W"
+    for r in range(BOARD_SIZE):
+        row = board[r]
+        for c in range(BOARD_SIZE):
+            if row[c] == target:
+                return _square_attacked(board, r, c, opponent_color)
+    return False
 
 
 def is_square_under_attack(board, row, col, attacker_color):
-    """REVERTED TO WORKING ORIGINAL - generates moves for all enemy pieces and checks if any attack the square."""
-    for r in range(BOARD_SIZE):
-        for c in range(BOARD_SIZE):
-            piece = board[r][c]
-            if piece.startswith(attacker_color):
-                moves = get_moves_for_piece(board, r, c, last_move=None, check_castling=False)
-                if any(end == (row, col) for _, end in moves):
-                    return True
-    return False
+    """REVERTED TO WORKING ORIGINAL - generates moves for all enemy pieces and checks if any attack the square.
+    Same result via _square_attacked (no per-piece move lists)."""
+    return _square_attacked(board, row, col, attacker_color)
 def is_move_legal(board, move, color, rights=None):
     # Capturing the king is how we detect check; it is never a legal move to play.
     dest = board[move[1][0]][move[1][1]]
@@ -870,14 +910,18 @@ def _quiescence_search_inner(board, color, AI_color, alpha, beta, depth, max_dep
             if stand_pat < beta:
                 beta = stand_pat
 
-    legal = get_all_legal_moves(board, color, last_move=last_move, check_legality=True, rights=castle_rights)
-    if not legal:
-        if in_check:
+    # In check you cannot stand pat — search every evasion (full legality).
+    # Otherwise only captures/EP/promo are searched, so only those pay for a pin test.
+    # Testing every quiet move here was most of the remaining depth-4 time.
+    if in_check:
+        moves = get_all_legal_moves(board, color, last_move=last_move, check_legality=True, rights=castle_rights)
+        if not moves:
             return _terminal_mate_score(color, depth), []
-        return 0.0, []
-
-    # In check you cannot stand pat — search every evasion. Otherwise captures/EP/promo only.
-    moves = legal if in_check else [m for m in legal if _is_noisy_move(board, m)]
+    else:
+        pseudo = get_all_legal_moves(board, color, last_move=last_move, check_legality=False, rights=castle_rights)
+        if not pseudo:
+            return 0.0, []  # stalemate
+        moves = [m for m in pseudo if _is_noisy_move(board, m) and is_move_legal(board, m, color, rights=castle_rights)]
     moves.sort(key=lambda m: _noisy_move_score(board, m), reverse=True)
     best_move = []
 
@@ -2437,7 +2481,7 @@ def initialize_game():
     running = True
     show_simulation = False  # Default: don't show AI thinking for faster gameplay
     end_of_game = False
-    depth = 4
+    depth = depth_white  # legacy single depth; Up/Down and PgUp/PgDn set the two sides, restart keeps them
     transposition_table = {}
     player = "W"
     ai = "B"
@@ -2483,7 +2527,7 @@ def initialize_game():
         f"Move: {move_number}. Player: {player}.  W: {friendly_ai_method_display(ai_method_white)}  "
         f"B: {friendly_ai_method_display(ai_method_black)}.  {depth_equation}",
         True, BLACK), (27, status_y(150)))
-    screen.blit(font_info.render(f"Depth: {depth}. Evaluation Method {evaluation_method}. Show simulation: {show_simulation}", True, BLACK), (27, status_y(125)))
+    screen.blit(font_info.render(f"Depth W:{depth_white} B:{depth_black}. Evaluation Method {evaluation_method}. Show simulation: {show_simulation}", True, BLACK), (27, status_y(125)))
     pygame.display.flip()
 
     # LLM models are loaded on-demand when switching to LLM mode
@@ -2518,11 +2562,10 @@ depth_equations = {
     }
 
 def help():
-    # Sit in the extended white strip under the board (never cover pieces).
-    # Prefer the bottom of the window so status lines stay visible above when possible.
-    help_h = 300
-    y0 = max(BOARD_PIXEL_H + 8, SCREEN_HEIGHT - help_h - 8)
-    pygame.draw.rect(screen, WHITE, (25, y0, SCREEN_WIDTH - 50, help_h))
+    # Bottom strip only (same band as captured pieces and move reports). No white above it.
+    help_h = max(0, SCREEN_HEIGHT - BOARD_PIXEL_H)
+    y0 = BOARD_PIXEL_H if help_h else 0
+    pygame.draw.rect(screen, WHITE, (25, y0, SCREEN_WIDTH - 50, help_h if help_h else SCREEN_HEIGHT))
 
     small_font = pygame.font.SysFont("Arial", 18)
     y = y0 + 4
@@ -2531,7 +2574,7 @@ def help():
     y += 22
     screen.blit(small_font.render("COLORS: c = toggle green/yellow/red hints  (green=safe, yellow=can retake, red=no retake; also marks what opponent can take)", True, BLACK), (27, y))
     y += 22
-    screen.blit(small_font.render("ENGINES: a = White Search/Neural   z = Black Search/Neural   Up/Down = Search depth", True, BLACK), (27, y))
+    screen.blit(small_font.render("ENGINES: a = White Search/Neural   z = Black Search/Neural   Up/Down = White depth   PgUp/PgDn = Black depth", True, BLACK), (27, y))
     y += 22
     screen.blit(small_font.render("NEURAL: W = pick White .pth    B = pick Black .pth    then Enter or 1 = newest checkpoint", True, BLACK), (27, y))
     y += 22
@@ -2561,6 +2604,9 @@ def help():
 player = "W"
 ai = "B"
 player_turn = True
+# Search depth per side. Neural ignores these. Up/Down = White, PgUp/PgDn = Black.
+depth_white = 4
+depth_black = 4
 actual_last_move = None
 setauto_switch_colors_for_player = False
 
@@ -2661,20 +2707,30 @@ while running:
                     f"B: {friendly_ai_method_display(ai_method_black)}.  {depth_equation}",
                     True, BLACK), (27, status_y(150)))
                 screen.blit(font_info.render(
-                    f"Depth: {depth}. Evaluation: {evaluation_method}. Simulation: {'On' if show_simulation else 'Off'}",
+                    f"Depth W:{depth_white} B:{depth_black}. Evaluation: {evaluation_method}. Simulation: {'On' if show_simulation else 'Off'}",
                     True, BLACK), (27, status_y(125)))
                 draw_llm_picker_overlay(screen)
                 pygame.display.flip()
                 continue
 
             if event.key == pygame.K_UP:
-                if depth < 21:
-                    depth += 1
-                    print("Depth set to", depth)
+                if depth_white < 21:
+                    depth_white += 1
+                    depth = depth_white
+                    print("White depth set to", depth_white)
             elif event.key == pygame.K_DOWN:
-                if depth > 0:
-                    depth -= 1
-                    print("Depth set to", depth)
+                if depth_white > 0:
+                    depth_white -= 1
+                    depth = depth_white
+                    print("White depth set to", depth_white)
+            elif event.key == pygame.K_PAGEUP:
+                if depth_black < 21:
+                    depth_black += 1
+                    print("Black depth set to", depth_black)
+            elif event.key == pygame.K_PAGEDOWN:
+                if depth_black > 0:
+                    depth_black -= 1
+                    print("Black depth set to", depth_black)
 
             if event.key == pygame.K_y:
                 show_simulation = not show_simulation
@@ -2812,6 +2868,9 @@ while running:
                         player = info.get("player", player)
                         ai = info.get("ai", ai)
                         depth = info.get("depth", depth)
+                        depth_white = info.get("depth_white", depth)
+                        depth_black = info.get("depth_black", depth)
+                        depth = depth_white
 
                         evaluation_method = info.get("evaluation_method", evaluation_method)
                         evaluate_board = evaluation_methods.get(evaluation_method, evaluate_board) # important to reset!
@@ -2926,7 +2985,7 @@ while running:
                 f"Move: {move_number}. Player: {player}.  W: {friendly_ai_method_display(ai_method_white)}  "
                 f"B: {friendly_ai_method_display(ai_method_black)}.  {depth_equation}",
                 True, BLACK), (27, status_y(150)))
-            screen.blit(font_info.render(f"Depth: {depth}. Evaluation: {evaluation_method}. Simulation: {'On' if show_simulation else 'Off'}", True, BLACK), (27, status_y(125)))
+            screen.blit(font_info.render(f"Depth W:{depth_white} B:{depth_black}. Evaluation: {evaluation_method}. Simulation: {'On' if show_simulation else 'Off'}", True, BLACK), (27, status_y(125)))
             draw_llm_picker_overlay(screen)
 
             pygame.display.flip()
@@ -3059,7 +3118,7 @@ while running:
             # Update display after each click
             #pygame.draw.rect(screen, WHITE, (25, status_y(150), SCREEN_WIDTH - 50,50))
             #screen.blit(font_info.render(f"Move: {move_number}. Player: {player}.  Ai: {ai_method}. {depth_equation}", True, BLACK), (27, status_y(150)))
-            #screen.blit(font_info.render(f"Depth: {depth}. Evaluation: {evaluation_method}. Show simulation: {show_simulation}", True, BLACK), (27, status_y(125)))
+            #screen.blit(font_info.render(f"Depth W:{depth_white} B:{depth_black}. Evaluation: {evaluation_method}. Show simulation: {show_simulation}", True, BLACK), (27, status_y(125)))
             pygame.display.flip()
 
     # AI Turn Processing Section
@@ -3082,7 +3141,6 @@ while running:
     if not player_turn and not end_of_game:
         # Adding a timer to the AI's move
         start_time = time.time()
-        ai_depth = depth  # You can ask the user for this input or adjust as needed
         move_number = move_number + 1
 
         # Set ai_method for non-self-play mode (player vs AI)
@@ -3091,15 +3149,18 @@ while running:
             ai = "B" if player == "W" else "W"
             ai_method = ai_method_black if player == "W" else ai_method_white
 
+        # Each side uses its own Search depth (Neural ignores depth)
+        ai_depth = depth_white if ai == "W" else depth_black
+
         # ai_method is already set above for self-play
-        print(f"AI {piece_dict[ai]} {friendly_ai_method_display(ai_method)} is thinking...")
+        print(f"AI {piece_dict[ai]} {friendly_ai_method_display(ai_method)} is thinking... depth {ai_depth}")
         pygame.draw.rect(screen, WHITE, (25, status_y(200), SCREEN_WIDTH - 50,100))
         screen.blit(font.render(f"AI {piece_dict[ai]} {friendly_ai_method_display(ai_method)} is thinking...", True, BLACK), (27, status_y(200)))
         screen.blit(font_info.render(
             f"Move: {move_number}. Player: {player}.  W: {friendly_ai_method_display(ai_method_white)}  "
             f"B: {friendly_ai_method_display(ai_method_black)}.  {depth_equation}",
             True, BLACK), (27, status_y(150)))
-        screen.blit(font_info.render(f"Depth: {depth}. Evaluation: {evaluation_method}. Simulation: {'On' if show_simulation else 'Off'}", True, BLACK), (27, status_y(125)))
+        screen.blit(font_info.render(f"Depth W:{depth_white} B:{depth_black}. Evaluation: {evaluation_method}. Simulation: {'On' if show_simulation else 'Off'}", True, BLACK), (27, status_y(125)))
         pygame.display.flip()
         # Keep the TT across moves (transpositions); only drop it if it grew past TT_MAX_ENTRIES
         print(f"Transposition table size: {len(transposition_table)}")
